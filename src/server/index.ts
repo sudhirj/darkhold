@@ -12,7 +12,7 @@ const manager = new AgentManager();
 
 function parseConfig(argv: string[]): ServerConfig {
   let bind = '127.0.0.1';
-  let port = 3000;
+  let port = 3275;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];

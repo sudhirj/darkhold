@@ -15,7 +15,7 @@ bun install
 
 ## Run in Development
 
-Start on localhost port `3000`:
+Start on localhost port `3275` (D=3, A=2, R=7, K=5):
 
 ```bash
 bun run dev
@@ -24,10 +24,10 @@ bun run dev
 Run on a custom interface/port:
 
 ```bash
-bun run start -- --bind 127.0.0.1 --port 3000
+bun run start -- --bind 127.0.0.1 --port 3275
 ```
 
-Open: `http://127.0.0.1:3000`
+Open: `http://127.0.0.1:3275`
 
 ## Build
 

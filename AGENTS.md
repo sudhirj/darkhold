@@ -13,7 +13,7 @@ This project hosts Codex agents on a local machine and exposes them over HTTP. U
 Standardize on Bun scripts in `package.json`:
 - `bun install` installs dependencies.
 - `bun run dev` starts server + web UI in development.
-- `bun run start -- --bind 127.0.0.1 --port 3000` runs the distributable locally on a chosen interface/port.
+- `bun run start -- --bind 127.0.0.1 --port 3275` runs the distributable locally on a chosen interface/port.
 - `bun run test` runs automated tests.
 - `bun run lint` runs TypeScript + lint checks.
 - `bun run build` creates the production bundle/binary.
