@@ -1,0 +1,29 @@
+:root {
+  --font-ui: 'IBM Plex Sans', sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+}
+
+body {
+  font-family: var(--font-ui);
+  background: linear-gradient(165deg, #f9f8f4 0%, #efece5 100%);
+  min-height: 100vh;
+}
+
+code,
+pre,
+textarea,
+input,
+.font-mono {
+  font-family: var(--font-mono) !important;
+}
+
+.folder-list {
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.event-log {
+  max-height: 420px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}

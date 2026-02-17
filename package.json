@@ -1,0 +1,28 @@
+{
+  "name": "darkhold",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/server/index.ts -- --bind 127.0.0.1 --port 3000",
+    "start": "bun run src/server/index.ts",
+    "build:web": "bun build src/web/main.tsx --outfile dist/public/app.js --target browser --format esm --minify",
+    "build:server": "bun build src/server/index.ts --outfile dist/server.js --target bun --format esm --minify",
+    "build": "mkdir -p dist/public && bun run build:web && cp src/web/index.html dist/public/index.html && cp src/web/styles.css dist/public/styles.css && bun run build:server",
+    "bundle": "mkdir -p dist && bun build src/server/index.ts --compile --outfile dist/darkhold",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@headlessui/react": "^2.2.0",
+    "@ibm/plex": "^1.0.2",
+    "@openai/codex-sdk": "^0.9.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "bun-types": "^1.2.0",
+    "typescript": "^5.7.0"
+  }
+}
