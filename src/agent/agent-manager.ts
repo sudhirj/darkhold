@@ -45,6 +45,15 @@ function safeStringify(value: unknown): string {
 }
 
 function summarizeEvent(event: any): string {
+  if (event?.type === 'thread.started' && typeof event?.thread_id === 'string') {
+    return `Thread started: ${event.thread_id}`;
+  }
+  if (event?.item?.type === 'agent_message' && typeof event?.item?.text === 'string') {
+    return event.item.text;
+  }
+  if (event?.item?.type && typeof event?.item?.type === 'string') {
+    return `Completed item: ${event.item.type}`;
+  }
   if (typeof event?.text === 'string') {
     return event.text;
   }
