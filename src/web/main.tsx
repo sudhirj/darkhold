@@ -61,10 +61,27 @@ function statusClass(status: Session['status']): string {
   return 'text-bg-secondary';
 }
 
+function pathSegments(root: string, currentPath: string): Array<{ label: string; path: string }> {
+  const normalizedRoot = root.endsWith('/') ? root.slice(0, -1) : root;
+  const normalizedCurrent = currentPath.endsWith('/') ? currentPath.slice(0, -1) : currentPath;
+  const relative = normalizedCurrent.slice(normalizedRoot.length).replace(/^\/+/, '');
+  const segments = relative.length === 0 ? [] : relative.split('/');
+  const breadcrumb = [{ label: '~', path: normalizedRoot }];
+
+  let runningPath = normalizedRoot;
+  for (const segment of segments) {
+    runningPath = `${runningPath}/${segment}`;
+    breadcrumb.push({ label: segment, path: runningPath });
+  }
+
+  return breadcrumb;
+}
+
 function App() {
   const [listing, setListing] = useState<FolderListing | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedDir, setSelectedDir] = useState<FolderEntry | null>(null);
+  const [sessions, setSessions] = useState<Session[]>([]);
   const [session, setSession] = useState<Session | null>(null);
   const [prompt, setPrompt] = useState('');
 
@@ -75,6 +92,7 @@ function App() {
 
   useEffect(() => {
     void refreshFolder();
+    void refreshSessions();
   }, []);
 
   useEffect(() => {
@@ -90,12 +108,11 @@ function App() {
   }, [listing?.path, directories.length]);
 
   useEffect(() => {
-    if (!session) {
-      return;
-    }
-
     const timer = setInterval(() => {
-      void pollSession(session.id);
+      if (session) {
+        void pollSession(session.id);
+      }
+      void refreshSessions();
     }, 1000);
 
     return () => clearInterval(timer);
@@ -118,6 +135,10 @@ function App() {
     await refreshFolder(selectedDir.path);
   }
 
+  async function enterDirectory(targetPath: string) {
+    await refreshFolder(targetPath);
+  }
+
   async function startSession() {
     const targetPath = selectedDir?.path ?? listing?.path;
     if (!targetPath) {
@@ -132,9 +153,23 @@ function App() {
         body: JSON.stringify({ path: targetPath }),
       });
       setSession(payload.session);
+      await refreshSessions();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  async function refreshSessions() {
+    try {
+      const payload = await jsonFetch<{ sessions: Session[] }>('/api/agents');
+      setSessions(payload.sessions);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function resumeSession(sessionId: string) {
+    await pollSession(sessionId);
   }
 
   async function pollSession(sessionId: string) {
@@ -185,6 +220,21 @@ function App() {
               <p className="small text-secondary mb-2">Current path</p>
               <p className="font-mono small border rounded p-2">{listing?.path ?? 'Loading...'}</p>
 
+              {listing ? (
+                <div className="d-flex flex-wrap gap-1 mb-3">
+                  {pathSegments(listing.root, listing.path).map((segment) => (
+                    <button
+                      key={segment.path}
+                      className="btn btn-sm btn-outline-secondary"
+                      type="button"
+                      onClick={() => void refreshFolder(segment.path)}
+                    >
+                      {segment.label}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+
               <div className="d-flex gap-2 mb-3">
                 <button
                   className="btn btn-outline-secondary btn-sm"
@@ -226,6 +276,44 @@ function App() {
                   </ListboxOptions>
                 </div>
               </Listbox>
+
+              <div className="mt-3">
+                <p className="small text-secondary mb-2">Drill into folders</p>
+                <ul className="list-group folder-list">
+                  {listing?.parent ? (
+                    <li className="list-group-item p-2">
+                      <button
+                        className="btn btn-sm btn-outline-secondary"
+                        type="button"
+                        onClick={() => void refreshFolder(listing.parent ?? undefined)}
+                      >
+                        .. (up)
+                      </button>
+                    </li>
+                  ) : null}
+                  {directories.map((dir) => (
+                    <li key={dir.path} className="list-group-item d-flex justify-content-between align-items-center gap-2">
+                      <button
+                        className="btn btn-link text-decoration-none p-0 text-start"
+                        type="button"
+                        onClick={() => void setSelectedDir(dir)}
+                      >
+                        {dir.name}
+                      </button>
+                      <button
+                        className="btn btn-sm btn-outline-primary"
+                        type="button"
+                        onClick={() => void enterDirectory(dir.path)}
+                      >
+                        Enter
+                      </button>
+                    </li>
+                  ))}
+                  {directories.length === 0 ? (
+                    <li className="list-group-item text-secondary">No directories in this folder.</li>
+                  ) : null}
+                </ul>
+              </div>
             </div>
           </div>
         </section>
@@ -237,6 +325,38 @@ function App() {
               {session ? <span className={`badge ${statusClass(session.status)}`}>{session.status}</span> : null}
             </div>
             <div className="card-body">
+              <div className="mb-3">
+                <div className="d-flex justify-content-between align-items-center mb-2">
+                  <h2 className="h6 mb-0">Active Sessions</h2>
+                  <button className="btn btn-sm btn-outline-secondary" type="button" onClick={() => void refreshSessions()}>
+                    Refresh
+                  </button>
+                </div>
+                <ul className="list-group mb-3">
+                  {sessions.length === 0 ? (
+                    <li className="list-group-item text-secondary">No active sessions.</li>
+                  ) : null}
+                  {sessions.map((item) => (
+                    <li key={item.id} className="list-group-item d-flex justify-content-between align-items-center gap-2">
+                      <div>
+                        <div className="small font-mono">{item.id.slice(0, 8)}</div>
+                        <div className="small text-secondary text-break">{item.cwd}</div>
+                      </div>
+                      <div className="d-flex align-items-center gap-2">
+                        <span className={`badge ${statusClass(item.status)}`}>{item.status}</span>
+                        <button
+                          className="btn btn-sm btn-outline-primary"
+                          type="button"
+                          onClick={() => void resumeSession(item.id)}
+                        >
+                          Resume
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
               {!session ? <p className="text-secondary mb-0">No active session yet.</p> : null}
 
               {session ? (

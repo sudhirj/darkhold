@@ -141,11 +141,18 @@ export class AgentManager {
 
     for await (const event of streamed.events) {
       const eventType = String(event?.type ?? 'event');
+      if (eventType === 'thread.started' && typeof event?.thread_id === 'string') {
+        session.threadId = event.thread_id;
+      }
       this.pushEvent(session, eventType, summarizeEvent(event));
       session.progress.lastEventType = eventType;
       if (eventType === 'item.completed') {
         session.progress.completedItems += 1;
       }
+    }
+
+    if (!session.threadId && typeof session.thread?.id === 'string') {
+      session.threadId = session.thread.id;
     }
 
     session.status = 'idle';

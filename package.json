@@ -10,12 +10,12 @@
     "build:server": "bun build src/server/index.ts --outfile dist/server.js --target bun --format esm --minify",
     "build": "mkdir -p dist/public && bun run build:web && cp src/web/index.html dist/public/index.html && cp src/web/styles.css dist/public/styles.css && bun run build:server",
     "bundle": "mkdir -p dist && bun build src/server/index.ts --compile --outfile dist/darkhold",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@headlessui/react": "^2.2.0",
     "@ibm/plex": "^1.0.2",
-    "@openai/codex-sdk": "^0.9.0",
+    "@openai/codex-sdk": "^0.101.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
