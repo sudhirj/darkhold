@@ -194,7 +194,7 @@ function App() {
 
   return (
     <>
-      <nav className="navbar bg-body-tertiary border-bottom">
+      <nav className="navbar bg-body-tertiary border-bottom fixed-top">
         <div className="container">
           <span className="navbar-brand mb-0 h1">Darkhold Agent Host</span>
           <button

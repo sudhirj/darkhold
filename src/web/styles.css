@@ -14,6 +14,7 @@ body {
 body {
   font-family: var(--font-ui);
   background: transparent;
+  padding-top: 3rem;
 }
 
 code,
