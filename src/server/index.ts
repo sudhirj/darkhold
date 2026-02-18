@@ -1,12 +1,13 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { AgentManager } from '../agent/agent-manager';
-import { getHomeRoot, listFolder } from '../fs/home-browser';
+import { getHomeRoot, listFolder, setBrowserRoot } from '../fs/home-browser';
 
 type ServerConfig = {
   bind: string;
   port: number;
   allowCidrs: string[];
+  basePath?: string;
 };
 
 const manager = new AgentManager();
@@ -15,6 +16,7 @@ function parseConfig(argv: string[]): ServerConfig {
   let bind = '127.0.0.1';
   let port = 3275;
   const allowCidrs: string[] = [];
+  let basePath: string | undefined;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -43,6 +45,15 @@ function parseConfig(argv: string[]): ServerConfig {
     }
     if (arg.startsWith('--allow-cidr=')) {
       allowCidrs.push(arg.split('=')[1] || '');
+      continue;
+    }
+    if (arg === '--base-path' && argv[i + 1]) {
+      basePath = argv[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--base-path=')) {
+      basePath = arg.split('=')[1] || basePath;
     }
   }
 
@@ -56,7 +67,7 @@ function parseConfig(argv: string[]): ServerConfig {
     }
   }
 
-  return { bind, port, allowCidrs };
+  return { bind, port, allowCidrs, basePath };
 }
 
 function normalizeIpv4Address(address: string): string | null {
@@ -214,6 +225,7 @@ function getSessionIdFromPath(url: URL): string | null {
 }
 
 const config = parseConfig(process.argv.slice(2));
+await setBrowserRoot(config.basePath);
 const [cachedIndexHtml, cachedStylesCss, cachedAppJs] = isDevLive
   ? [null, null, null]
   : await Promise.all([loadFrontendAsset('index.html'), loadFrontendAsset('styles.css'), buildFrontendBundle()]);
@@ -230,7 +242,7 @@ const server = Bun.serve({
     const url = new URL(req.url);
 
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      return json({ ok: true, home: getHomeRoot() });
+      return json({ ok: true, basePath: getHomeRoot() });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/fs/list') {
@@ -337,4 +349,4 @@ const server = Bun.serve({
 
 const allowListNote =
   config.allowCidrs.length > 0 ? ` (allowed CIDRs: ${config.allowCidrs.join(', ')}, plus localhost)` : '';
-console.log(`darkhold listening on http://${config.bind}:${server.port}${allowListNote}`);
+console.log(`darkhold listening on http://${config.bind}:${server.port}${allowListNote} (base path: ${getHomeRoot()})`);

@@ -3,10 +3,17 @@
   --font-mono: 'IBM Plex Mono', monospace;
 }
 
+html,
+body {
+  background-color: #efece5;
+  background: linear-gradient(165deg, #f9f8f4 0%, #efece5 100%);
+  min-height: 100%;
+  overscroll-behavior-y: none;
+}
+
 body {
   font-family: var(--font-ui);
-  background: linear-gradient(165deg, #f9f8f4 0%, #efece5 100%);
-  min-height: 100vh;
+  background: transparent;
 }
 
 code,

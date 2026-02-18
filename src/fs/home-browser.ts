@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { readdir } from 'node:fs/promises';
+import { realpath, readdir } from 'node:fs/promises';
 
 export type FolderEntry = {
   name: string;
@@ -15,22 +15,32 @@ export type FolderListing = {
   entries: FolderEntry[];
 };
 
-const homeRoot = path.resolve(homedir());
+let configuredRoot = path.resolve(homedir());
+let configuredRootReal = path.resolve(homedir());
 
-function assertWithinHome(targetPath: string): string {
+async function resolveAndAssertWithinRoot(targetPath: string): Promise<string> {
   const resolved = path.resolve(targetPath);
-  if (resolved === homeRoot || resolved.startsWith(`${homeRoot}${path.sep}`)) {
-    return resolved;
+  const resolvedReal = await realpath(resolved);
+  if (resolvedReal === configuredRootReal || resolvedReal.startsWith(`${configuredRootReal}${path.sep}`)) {
+    return resolvedReal;
   }
-  throw new Error('Path must be inside the user home directory.');
+  throw new Error('Path must be inside the configured base path.');
+}
+
+export async function setBrowserRoot(basePath?: string): Promise<string> {
+  const resolved = path.resolve(basePath ?? homedir());
+  const resolvedReal = await realpath(resolved);
+  configuredRoot = resolved;
+  configuredRootReal = resolvedReal;
+  return configuredRootReal;
 }
 
 export function getHomeRoot(): string {
-  return homeRoot;
+  return configuredRootReal;
 }
 
 export async function listFolder(inputPath?: string): Promise<FolderListing> {
-  const currentPath = assertWithinHome(inputPath ?? homeRoot);
+  const currentPath = await resolveAndAssertWithinRoot(inputPath ?? configuredRoot);
   const dirents = await readdir(currentPath, { withFileTypes: true });
 
   const entries = dirents
@@ -50,10 +60,10 @@ export async function listFolder(inputPath?: string): Promise<FolderListing> {
       return a.name.localeCompare(b.name);
     });
 
-  const parent = currentPath === homeRoot ? null : path.dirname(currentPath);
+  const parent = currentPath === configuredRootReal ? null : path.dirname(currentPath);
 
   return {
-    root: homeRoot,
+    root: configuredRootReal,
     path: currentPath,
     parent,
     entries,

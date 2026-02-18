@@ -36,9 +36,10 @@ Standardize on Bun scripts in `package.json`:
 - Define these as shared CSS tokens early (example: `--font-ui`, `--font-mono`) and avoid ad-hoc font overrides.
 
 ## UI Frameworks
-- Use Bootstrap for layout and baseline styling (`container`, `row`, `card`, `btn`, `badge`, etc.).
-- Use Headless UI (`@headlessui/react`) for interactive components where stateful behavior matters (selectors, dialogs, menus).
-- Use Bootstrap classes only for component layout and styling; do not add custom CSS classes for UI components.
+- Use Bootstrap classes for layout and visual styling (`container`, `row`, `card`, `btn`, `badge`, etc.).
+- Use Headless UI (`@headlessui/react`) components for interactive/stateful functionality (selectors, dialogs, menus, buttons).
+- Keep functionality in Headless UI components and use Bootstrap primarily as the CSS layer.
+- Before implementing or modifying any Headless UI or Bootstrap component, read the official documentation page for that exact component/API and follow its recommended structure and behavior.
 
 ## Testing Guidelines
 - Use Bun test runner for unit/integration tests.
