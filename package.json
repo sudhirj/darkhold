@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun run src/server/index.ts -- --bind 127.0.0.1 --port 3275",
+    "dev": "bun run src/server/index.ts -- --bind 0.0.0.0 --port 3275 --allow-cidr 100.64.0.0/10",
+    "dev:hot": "DARKHOLD_DEV=1 bun --hot --no-clear-screen src/server/index.ts -- --bind 0.0.0.0 --port 3275 --allow-cidr 100.64.0.0/10",
     "start": "bun run src/server/index.ts",
     "build:web": "bun build src/web/main.tsx --outfile dist/public/app.js --target browser --format esm --minify",
     "build:server": "bun build src/server/index.ts --outfile dist/server.js --target bun --format esm --minify",

@@ -1,5 +1,10 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Button,
+  Combobox,
+  ComboboxInput,
+  ComboboxOption,
+  ComboboxOptions,
   Listbox,
   ListboxButton,
   ListboxOption,
@@ -105,19 +110,22 @@ function pathSegments(root: string, currentPath: string): Array<{ label: string;
 }
 
 function App() {
-  const [listing, setListing] = useState<FolderListing | null>(null);
+  const [folderCache, setFolderCache] = useState<Record<string, FolderListing>>({});
+  const [columnPaths, setColumnPaths] = useState<string[]>([]);
+  const [columnSearch, setColumnSearch] = useState<Record<string, string>>({});
+  const [columnSelections, setColumnSelections] = useState<Record<string, string | null>>({});
   const [error, setError] = useState<string | null>(null);
-  const [selectedDir, setSelectedDir] = useState<FolderEntry | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [session, setSession] = useState<Session | null>(null);
   const [prompt, setPrompt] = useState('');
   const conversationEndRef = useRef<HTMLDivElement | null>(null);
+  const folderInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const suppressNextAutoFocusRef = useRef(false);
+  const [pendingFocusPath, setPendingFocusPath] = useState<string | null>(null);
   const activeSessionId = session?.id ?? '';
 
-  const directories = useMemo(
-    () => (listing?.entries ?? []).filter((entry) => entry.kind === 'directory'),
-    [listing],
-  );
+  const currentPath = columnPaths.length > 0 ? columnPaths[columnPaths.length - 1] : null;
+  const currentListing = currentPath ? folderCache[currentPath] ?? null : null;
 
   const conversationEvents = useMemo(
     () => (session?.events ?? []).filter((event) => isConversationEvent(event)),
@@ -133,21 +141,9 @@ function App() {
   );
 
   useEffect(() => {
-    void refreshFolder();
+    void initializeFolderBrowser();
     void refreshSessions();
   }, []);
-
-  useEffect(() => {
-    if (!listing) {
-      return;
-    }
-
-    if (selectedDir && directories.some((dir) => dir.path === selectedDir.path)) {
-      return;
-    }
-
-    setSelectedDir(directories[0] ?? null);
-  }, [listing?.path, directories.length]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -164,33 +160,69 @@ function App() {
     conversationEndRef.current?.scrollIntoView({ block: 'end' });
   }, [session?.latestEventSeq]);
 
-  async function refreshFolder(path?: string) {
+  useEffect(() => {
+    if (!pendingFocusPath) {
+      return;
+    }
+    const nextInput = folderInputRefs.current[pendingFocusPath];
+    if (nextInput) {
+      nextInput.focus();
+      setPendingFocusPath(null);
+    }
+  }, [pendingFocusPath, columnPaths]);
+
+  function directoriesFor(listingPath: string): FolderEntry[] {
+    const listing = folderCache[listingPath];
+    if (!listing) {
+      return [];
+    }
+    return listing.entries.filter((entry) => entry.kind === 'directory');
+  }
+
+  async function loadFolder(path?: string): Promise<FolderListing> {
+    const next = await jsonFetch<FolderListing>(`/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ''}`);
+    setFolderCache((prev) => ({ ...prev, [next.path]: next }));
+    return next;
+  }
+
+  async function initializeFolderBrowser() {
     try {
       setError(null);
-      const next = await jsonFetch<FolderListing>(`/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ''}`);
-      setListing(next);
+      const homeListing = await loadFolder();
+      setColumnPaths([homeListing.path]);
+      setColumnSearch({});
+      setColumnSelections({});
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }
 
-  async function openSelectedFolder() {
-    if (!selectedDir) {
-      return;
+  function filterDirectories(listingPath: string): FolderEntry[] {
+    const searchValue = columnSearch[listingPath]?.trim().toLowerCase() ?? '';
+    const dirs = directoriesFor(listingPath);
+    if (!searchValue) {
+      return dirs;
     }
-    await refreshFolder(selectedDir.path);
+    return dirs.filter((entry) => entry.name.toLowerCase().includes(searchValue));
   }
 
-  async function enterDirectory(targetPath: string) {
-    await refreshFolder(targetPath);
+  async function onSelectDirectory(columnIndex: number, listingPath: string, targetPath: string) {
+    try {
+      setError(null);
+      const nextListing = await loadFolder(targetPath);
+      setColumnSelections((prev) => ({ ...prev, [listingPath]: targetPath }));
+      setColumnPaths((prev) => [...prev.slice(0, columnIndex + 1), nextListing.path]);
+      if (suppressNextAutoFocusRef.current) {
+        suppressNextAutoFocusRef.current = false;
+      } else {
+        setPendingFocusPath(nextListing.path);
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
-  async function startSession() {
-    const targetPath = listing?.path;
-    if (!targetPath) {
-      return;
-    }
-
+  async function startSessionForPath(targetPath: string) {
     try {
       setError(null);
       const payload = await jsonFetch<{ session: Session }>('/api/agents/start', {
@@ -247,6 +279,16 @@ function App() {
     }
   }
 
+  function handlePromptKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      if (!session || !prompt.trim() || session.status === 'running') {
+        return;
+      }
+      event.currentTarget.form?.requestSubmit();
+    }
+  }
+
   return (
     <main className="container py-4">
       <div className="mb-4">
@@ -264,16 +306,21 @@ function App() {
             <div className="card-header">Folder Browser</div>
             <div className="card-body">
               <p className="small text-secondary mb-2">Current path</p>
-              <p className="font-mono small border rounded p-2">{listing?.path ?? 'Loading...'}</p>
+              <p className="font-mono small border rounded p-2">{currentPath ?? 'Loading...'}</p>
 
-              {listing ? (
+              {currentListing ? (
                 <div className="d-flex flex-wrap gap-1 mb-3">
-                  {pathSegments(listing.root, listing.path).map((segment) => (
+                  {pathSegments(currentListing.root, currentListing.path).map((segment) => (
                     <button
                       key={segment.path}
                       className="btn btn-sm btn-outline-secondary"
                       type="button"
-                      onClick={() => void refreshFolder(segment.path)}
+                      onClick={() => {
+                        const segmentIndex = columnPaths.findIndex((path) => path === segment.path);
+                        if (segmentIndex >= 0) {
+                          setColumnPaths((prev) => prev.slice(0, segmentIndex + 1));
+                        }
+                      }}
                     >
                       {segment.label}
                     </button>
@@ -281,84 +328,100 @@ function App() {
                 </div>
               ) : null}
 
-              <div className="d-flex gap-2 mb-3">
-                <button
-                  className="btn btn-outline-secondary btn-sm"
-                  type="button"
-                  onClick={() => void refreshFolder(listing?.parent ?? undefined)}
-                  disabled={!listing?.parent}
-                >
-                  Up
-                </button>
-                <button
-                  className="btn btn-outline-primary btn-sm"
-                  type="button"
-                  onClick={() => void openSelectedFolder()}
-                  disabled={!selectedDir}
-                >
-                  Open Selected
-                </button>
-                <button className="btn btn-primary btn-sm" type="button" onClick={() => void startSession()}>
-                  Start Agent
-                </button>
-              </div>
+              <div className="d-flex flex-column gap-2">
+                {columnPaths.map((listingPath, columnIndex) => {
+                  const listing = folderCache[listingPath];
+                  const directories = filterDirectories(listingPath);
+                  const allDirectories = directoriesFor(listingPath);
+                  const selectedPath = columnSelections[listingPath] ?? null;
+                  const selectedDirName =
+                    allDirectories.find((entry) => entry.path === selectedPath)?.name ?? null;
+                  const searchId = `folder-search-${columnIndex}`;
 
-              <label className="form-label">Directory</label>
-              <Listbox value={selectedDir} onChange={setSelectedDir}>
-                <div className="position-relative">
-                  <ListboxButton className="btn btn-light border w-100 text-start">
-                    {selectedDir ? selectedDir.name : 'No directories found'}
-                  </ListboxButton>
-                  <ListboxOptions className="position-absolute mt-1 w-100 border rounded bg-white shadow-sm p-1 folder-list z-3">
-                    {directories.map((dir) => (
-                      <ListboxOption
-                        key={dir.path}
-                        value={dir}
-                        className="list-group-item list-group-item-action border-0 rounded"
-                      >
-                        {dir.name}
-                      </ListboxOption>
-                    ))}
-                  </ListboxOptions>
-                </div>
-              </Listbox>
-
-              <div className="mt-3">
-                <p className="small text-secondary mb-2">Drill into folders</p>
-                <ul className="list-group folder-list">
-                  {listing?.parent ? (
-                    <li className="list-group-item p-2">
-                      <button
-                        className="btn btn-sm btn-outline-secondary"
-                        type="button"
-                        onClick={() => void refreshFolder(listing.parent ?? undefined)}
-                      >
-                        .. (up)
-                      </button>
-                    </li>
-                  ) : null}
-                  {directories.map((dir) => (
-                    <li key={dir.path} className="list-group-item d-flex justify-content-between align-items-center gap-2">
-                      <button
-                        className="btn btn-link text-decoration-none p-0 text-start"
-                        type="button"
-                        onClick={() => void setSelectedDir(dir)}
-                      >
-                        {dir.name}
-                      </button>
-                      <button
-                        className="btn btn-sm btn-outline-primary"
-                        type="button"
-                        onClick={() => void enterDirectory(dir.path)}
-                      >
-                        Enter
-                      </button>
-                    </li>
-                  ))}
-                  {directories.length === 0 ? (
-                    <li className="list-group-item text-secondary">No directories in this folder.</li>
-                  ) : null}
-                </ul>
+                  return (
+                    <section key={listingPath} className="w-100">
+                      <div className="d-flex gap-2 align-items-start">
+                        <div className="flex-grow-1">
+                          <Combobox
+                            immediate
+                            value={selectedPath}
+                            onChange={(nextPath) => {
+                              if (nextPath) {
+                                void onSelectDirectory(columnIndex, listingPath, nextPath);
+                              }
+                            }}
+                            disabled={!listing || allDirectories.length === 0}
+                          >
+                            <div className="position-relative">
+                              <ComboboxInput
+                                id={searchId}
+                                ref={(node) => {
+                                  folderInputRefs.current[listingPath] = node;
+                                }}
+                                className="form-control form-control-sm"
+                                aria-label={`Search folders in combobox ${columnIndex + 1}`}
+                                placeholder={listing ? 'Type to search folders' : 'Loading folders...'}
+                                displayValue={(value: string | null) =>
+                                  directoriesFor(listingPath).find((entry) => entry.path === value)?.name ?? ''
+                                }
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Tab') {
+                                    suppressNextAutoFocusRef.current = true;
+                                  } else if (event.key === 'Enter') {
+                                    suppressNextAutoFocusRef.current = false;
+                                  }
+                                }}
+                                onChange={(event) =>
+                                  setColumnSearch((prev) => ({
+                                    ...prev,
+                                    [listingPath]: event.target.value,
+                                  }))
+                                }
+                              />
+                              <ComboboxOptions className="position-absolute mt-1 w-100 border rounded bg-white shadow-sm p-1 z-3 folder-list">
+                                {listing && directories.map((dir) => (
+                                  <ComboboxOption
+                                    key={dir.path}
+                                    value={dir.path}
+                                    className={({ focus, selected }) =>
+                                      `list-group-item border-0 rounded px-2 py-2 d-flex justify-content-between align-items-center ${
+                                        selected
+                                          ? 'active'
+                                          : focus
+                                            ? 'list-group-item-primary'
+                                            : 'list-group-item-action'
+                                      }`
+                                    }
+                                  >
+                                    <span>{dir.name}</span>
+                                    {selectedPath === dir.path ? <i className="bi bi-check2" aria-hidden="true" /> : null}
+                                  </ComboboxOption>
+                                ))}
+                                {listing && directories.length === 0 ? (
+                                  <div className="list-group-item text-secondary border-0 rounded px-2 py-2">
+                                    No matching folders.
+                                  </div>
+                                ) : null}
+                              </ComboboxOptions>
+                            </div>
+                          </Combobox>
+                        </div>
+                        <Button
+                          as="button"
+                          type="button"
+                          tabIndex={0}
+                          className="btn btn-sm btn-outline-primary"
+                          onClick={() => void startSessionForPath(listingPath)}
+                          disabled={!listing}
+                          aria-label={`Open agent for combobox ${columnIndex + 1}`}
+                          title="Open agent"
+                        >
+                          <i className="bi bi-robot" aria-hidden="true" />
+                        </Button>
+                      </div>
+                    </section>
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -469,6 +532,7 @@ function App() {
                       rows={5}
                       placeholder="Ask Codex to inspect, edit, or explain this folder..."
                       value={prompt}
+                      onKeyDown={handlePromptKeyDown}
                       onChange={(event) => setPrompt(event.target.value)}
                     />
                     <button className="btn btn-primary" type="submit" disabled={session.status === 'running'}>

@@ -6,6 +6,7 @@ import { getHomeRoot, listFolder } from '../fs/home-browser';
 type ServerConfig = {
   bind: string;
   port: number;
+  allowCidrs: string[];
 };
 
 const manager = new AgentManager();
@@ -13,6 +14,7 @@ const manager = new AgentManager();
 function parseConfig(argv: string[]): ServerConfig {
   let bind = '127.0.0.1';
   let port = 3275;
+  const allowCidrs: string[] = [];
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -32,6 +34,15 @@ function parseConfig(argv: string[]): ServerConfig {
     }
     if (arg.startsWith('--port=')) {
       port = Number.parseInt(arg.split('=')[1] || '', 10);
+      continue;
+    }
+    if (arg === '--allow-cidr' && argv[i + 1]) {
+      allowCidrs.push(argv[i + 1]);
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--allow-cidr=')) {
+      allowCidrs.push(arg.split('=')[1] || '');
     }
   }
 
@@ -39,7 +50,81 @@ function parseConfig(argv: string[]): ServerConfig {
     throw new Error('Port must be a number between 1 and 65535.');
   }
 
-  return { bind, port };
+  for (const cidr of allowCidrs) {
+    if (!parseIpv4Cidr(cidr)) {
+      throw new Error(`Invalid CIDR: ${cidr}. Expected IPv4 CIDR such as 100.64.0.0/10.`);
+    }
+  }
+
+  return { bind, port, allowCidrs };
+}
+
+function normalizeIpv4Address(address: string): string | null {
+  if (address.startsWith('::ffff:')) {
+    return address.slice('::ffff:'.length);
+  }
+  const parts = address.split('.');
+  if (parts.length !== 4) {
+    return null;
+  }
+  const octets = parts.map((part) => Number.parseInt(part, 10));
+  if (octets.some((value) => !Number.isFinite(value) || value < 0 || value > 255)) {
+    return null;
+  }
+  return parts.join('.');
+}
+
+function parseIpv4(value: string): number | null {
+  const normalized = normalizeIpv4Address(value);
+  if (!normalized) {
+    return null;
+  }
+  const octets = normalized.split('.').map((part) => Number.parseInt(part, 10));
+  return (((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0);
+}
+
+function parseIpv4Cidr(cidr: string): { network: number; prefix: number } | null {
+  const [base, prefixRaw] = cidr.split('/');
+  if (!base || !prefixRaw) {
+    return null;
+  }
+  const prefix = Number.parseInt(prefixRaw, 10);
+  if (!Number.isFinite(prefix) || prefix < 0 || prefix > 32) {
+    return null;
+  }
+  const network = parseIpv4(base);
+  if (network === null) {
+    return null;
+  }
+  return { network, prefix };
+}
+
+function isLoopback(address: string): boolean {
+  return address === '::1' || address === '127.0.0.1' || address.startsWith('::ffff:127.');
+}
+
+function cidrContains(address: string, cidr: string): boolean {
+  const ip = parseIpv4(address);
+  const parsedCidr = parseIpv4Cidr(cidr);
+  if (ip === null || !parsedCidr) {
+    return false;
+  }
+  const { network, prefix } = parsedCidr;
+  const mask = prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) >>> 0);
+  return (ip & mask) === (network & mask);
+}
+
+function isAllowedClient(address: string | null, allowedCidrs: string[]): boolean {
+  if (!address) {
+    return allowedCidrs.length === 0;
+  }
+  if (isLoopback(address)) {
+    return true;
+  }
+  if (allowedCidrs.length === 0) {
+    return true;
+  }
+  return allowedCidrs.some((cidr) => cidrContains(address, cidr));
 }
 
 function json(data: unknown, status = 200): Response {
@@ -110,6 +195,8 @@ async function buildFrontendBundle(): Promise<string> {
   return await result.outputs[0].text();
 }
 
+const isDevLive = process.env.DARKHOLD_DEV === '1';
+
 async function readBody(req: Request): Promise<any> {
   try {
     return await req.json();
@@ -127,16 +214,19 @@ function getSessionIdFromPath(url: URL): string | null {
 }
 
 const config = parseConfig(process.argv.slice(2));
-const [indexHtml, stylesCss, appJs] = await Promise.all([
-  loadFrontendAsset('index.html'),
-  loadFrontendAsset('styles.css'),
-  buildFrontendBundle(),
-]);
+const [cachedIndexHtml, cachedStylesCss, cachedAppJs] = isDevLive
+  ? [null, null, null]
+  : await Promise.all([loadFrontendAsset('index.html'), loadFrontendAsset('styles.css'), buildFrontendBundle()]);
 
 const server = Bun.serve({
   hostname: config.bind,
   port: config.port,
-  async fetch(req) {
+  async fetch(req, server) {
+    const clientIp = server.requestIP(req)?.address ?? null;
+    if (!isAllowedClient(clientIp, config.allowCidrs)) {
+      return json({ error: 'Forbidden for client IP.' }, 403);
+    }
+
     const url = new URL(req.url);
 
     if (req.method === 'GET' && url.pathname === '/api/health') {
@@ -214,12 +304,14 @@ const server = Bun.serve({
     }
 
     if (req.method === 'GET' && url.pathname === '/styles.css') {
+      const stylesCss = isDevLive ? await loadFrontendAsset('styles.css') : cachedStylesCss;
       return new Response(stylesCss, {
         headers: { 'content-type': 'text/css; charset=utf-8' },
       });
     }
 
     if (req.method === 'GET' && url.pathname === '/app.js') {
+      const appJs = isDevLive ? await buildFrontendBundle() : cachedAppJs;
       return new Response(appJs, {
         headers: { 'content-type': 'text/javascript; charset=utf-8' },
       });
@@ -233,6 +325,7 @@ const server = Bun.serve({
     }
 
     if (req.method === 'GET' && url.pathname === '/') {
+      const indexHtml = isDevLive ? await loadFrontendAsset('index.html') : cachedIndexHtml;
       return new Response(indexHtml, {
         headers: { 'content-type': 'text/html; charset=utf-8' },
       });
@@ -242,4 +335,6 @@ const server = Bun.serve({
   },
 });
 
-console.log(`darkhold listening on http://${config.bind}:${server.port}`);
+const allowListNote =
+  config.allowCidrs.length > 0 ? ` (allowed CIDRs: ${config.allowCidrs.join(', ')}, plus localhost)` : '';
+console.log(`darkhold listening on http://${config.bind}:${server.port}${allowListNote}`);
