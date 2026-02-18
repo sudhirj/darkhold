@@ -29,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/sudhirj/darkhold/main/install.sh | 
 
 ## Run in Development
 
-Start on localhost port `3275` (D=3, A=2, R=7, K=5):
+Start on port `3275` (D=3, A=2, R=7, K=5):
 
 ```bash
 bun run dev
@@ -42,6 +42,23 @@ bun run start -- --bind 127.0.0.1 --port 3275
 ```
 
 Open: `http://127.0.0.1:3275`
+
+## Network Flags
+
+Darkhold server startup accepts:
+
+- `--bind`: Network interface to bind the HTTP server to.
+  Example: `127.0.0.1` (localhost only), `0.0.0.0` (all IPv4 interfaces).
+- `--port`: TCP port to listen on.
+  Default is `3275`.
+- `--allow-cidr`: Allowlist of remote IPv4 CIDRs.
+  You can pass this flag multiple times. Loopback (`127.0.0.1` / `::1`) is always allowed.
+
+Default behavior:
+
+- `bun run start` defaults to `--bind 127.0.0.1 --port 3275` with no CIDR restriction flag.
+- `bun run dev` defaults to `--bind 0.0.0.0 --port 3275 --allow-cidr 100.64.0.0/10`.
+- `100.64.0.0/10` is the default Tailscale CGNAT range used by the dev script.
 
 ## Build
 
