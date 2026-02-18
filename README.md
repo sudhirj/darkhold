@@ -13,6 +13,20 @@ Darkhold runs Codex agents on a host machine and exposes them over HTTP with a R
 bun install
 ```
 
+## Install From GitHub Releases
+
+Install the latest release binary directly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sudhirj/darkhold/main/install.sh | sh
+```
+
+Install a specific release tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sudhirj/darkhold/main/install.sh | sh -s -- --version build-<git-sha>
+```
+
 ## Run in Development
 
 Start on localhost port `3275` (D=3, A=2, R=7, K=5):
