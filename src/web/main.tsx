@@ -1,6 +1,6 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
+import { Dialog, DialogBackdrop, DialogPanel, DialogTitle, Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
 import ReconnectingWebSocket from 'reconnecting-websocket';
 import { jsonFetch } from './api';
 import { FolderBrowserDialog } from './components/folder-browser-dialog';
@@ -43,6 +43,40 @@ type ThreadReadResponse = {
   };
 };
 
+type UserInputQuestion = {
+  id: string;
+  question: string;
+  options: string[];
+};
+
+type PendingUiRequest =
+  | {
+      kind: 'approval';
+      title: string;
+      description: string;
+      command: string | null;
+      resolve: (result: unknown) => void;
+    }
+  | {
+      kind: 'user-input';
+      title: string;
+      questions: UserInputQuestion[];
+      resolve: (result: unknown) => void;
+    };
+
+type PendingUiRequestDraft =
+  | {
+      kind: 'approval';
+      title: string;
+      description: string;
+      command: string | null;
+    }
+  | {
+      kind: 'user-input';
+      title: string;
+      questions: UserInputQuestion[];
+    };
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -59,6 +93,10 @@ function statusFromTurnStatus(status: ThreadReadTurn['status']): SessionStatus {
     return 'error';
   }
   return 'idle';
+}
+
+function defaultAnswerForQuestion(question: UserInputQuestion): string {
+  return question.options.length > 0 ? question.options[0] : '';
 }
 
 function summarizeThreadItem(item: any): { type: string; message: string } | null {
@@ -366,6 +404,8 @@ function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [isFolderBrowserOpen, setIsFolderBrowserOpen] = useState(false);
   const [prompt, setPrompt] = useState('');
+  const [activeUiRequest, setActiveUiRequest] = useState<PendingUiRequest | null>(null);
+  const [uiAnswers, setUiAnswers] = useState<Record<string, string>>({});
   const conversationEndRef = useRef<HTMLDivElement | null>(null);
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const folderInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
@@ -373,6 +413,7 @@ function App() {
   const [pendingFocusPath, setPendingFocusPath] = useState<string | null>(null);
   const rpcRef = useRef<RpcClient | null>(null);
   const activeThreadIdRef = useRef<string | null>(null);
+  const queuedUiRequestsRef = useRef<PendingUiRequest[]>([]);
 
   const activeSessionId = session?.id ?? '';
   const selectorLabel = session ? `${session.id.slice(0, 8)} · ${session.cwd}` : 'Select session';
@@ -443,6 +484,18 @@ function App() {
     }
   }, [pendingFocusPath, columnPaths]);
 
+  useEffect(() => {
+    if (!activeUiRequest || activeUiRequest.kind !== 'user-input') {
+      setUiAnswers({});
+      return;
+    }
+    const defaults: Record<string, string> = {};
+    for (const question of activeUiRequest.questions) {
+      defaults[question.id] = defaultAnswerForQuestion(question);
+    }
+    setUiAnswers(defaults);
+  }, [activeUiRequest]);
+
   function directoriesFor(listingPath: string): FolderEntry[] {
     const listing = folderCache[listingPath];
     if (!listing) {
@@ -488,30 +541,97 @@ function App() {
     });
   }
 
+  function enqueueUiRequest(request: PendingUiRequestDraft): Promise<unknown> {
+    return new Promise((resolve) => {
+      const queued = { ...request, resolve } as PendingUiRequest;
+      setActiveUiRequest((current) => {
+        if (!current) {
+          return queued;
+        }
+        queuedUiRequestsRef.current.push(queued);
+        return current;
+      });
+    });
+  }
+
+  function popNextUiRequest() {
+    const next = queuedUiRequestsRef.current.shift() ?? null;
+    setActiveUiRequest(next);
+  }
+
+  function resolveActiveUiRequest(result: unknown) {
+    if (!activeUiRequest) {
+      return;
+    }
+    activeUiRequest.resolve(result);
+    popNextUiRequest();
+  }
+
+  function declineApprovalRequest() {
+    resolveActiveUiRequest({ decision: 'decline' });
+  }
+
+  function acceptApprovalRequest() {
+    resolveActiveUiRequest({ decision: 'accept' });
+  }
+
+  function submitUserInputRequest() {
+    if (!activeUiRequest || activeUiRequest.kind !== 'user-input') {
+      return;
+    }
+    const answers: Record<string, { answers: string[] }> = {};
+    for (const question of activeUiRequest.questions) {
+      const fallback = defaultAnswerForQuestion(question);
+      const value = (uiAnswers[question.id] ?? fallback).trim() || fallback;
+      answers[question.id] = { answers: [value] };
+    }
+    resolveActiveUiRequest({ answers });
+  }
+
+  function handleUiRequestClose() {
+    if (!activeUiRequest) {
+      return;
+    }
+    if (activeUiRequest.kind === 'approval') {
+      declineApprovalRequest();
+      return;
+    }
+    submitUserInputRequest();
+  }
+
   async function handleServerRequest(request: JsonRpcRequest): Promise<unknown> {
     if (request.method === 'item/commandExecution/requestApproval' || request.method === 'execCommandApproval') {
       const params = (request.params ?? {}) as { command?: string | null };
       const command = params.command ?? 'Unknown command';
-      const approved = window.confirm(`Allow command execution?\n\n${command}`);
-      return { decision: approved ? 'accept' : 'decline' };
+      return await enqueueUiRequest({
+        kind: 'approval',
+        title: 'Command Approval',
+        description: 'Allow command execution?',
+        command,
+      });
     }
 
     if (request.method === 'item/fileChange/requestApproval' || request.method === 'applyPatchApproval') {
-      const approved = window.confirm('Allow requested file changes?');
-      return { decision: approved ? 'accept' : 'decline' };
+      return await enqueueUiRequest({
+        kind: 'approval',
+        title: 'File Change Approval',
+        description: 'Allow requested file changes?',
+        command: null,
+      });
     }
 
     if (request.method === 'item/tool/requestUserInput') {
       const params = (request.params ?? {}) as { questions?: Array<{ id: string; question: string; options?: Array<{ label: string }> | null }> };
-      const answers: Record<string, { answers: string[] }> = {};
-
-      for (const question of params.questions ?? []) {
-        const defaultAnswer = question.options && question.options.length > 0 ? question.options[0].label : '';
-        const answer = window.prompt(question.question, defaultAnswer);
-        answers[question.id] = { answers: [answer ?? defaultAnswer] };
-      }
-
-      return { answers };
+      const questions: UserInputQuestion[] = (params.questions ?? []).map((question) => ({
+        id: question.id,
+        question: question.question,
+        options: (question.options ?? []).map((option) => option.label),
+      }));
+      return await enqueueUiRequest({
+        kind: 'user-input',
+        title: 'Codex Question',
+        questions,
+      });
     }
 
     throw new Error(`Unsupported server request: ${request.method}`);
@@ -538,6 +658,9 @@ function App() {
 
     if ((method === 'item/started' || method === 'item/completed') && payload.item) {
       if (payload.threadId !== activeThreadIdRef.current) {
+        return;
+      }
+      if (method === 'item/started' && payload.item?.type === 'userMessage') {
         return;
       }
       const summary = summarizeThreadItem(payload.item);
@@ -892,6 +1015,73 @@ function App() {
           onPromptChange={setPrompt}
         />
       </main>
+
+      {activeUiRequest ? (
+        <Dialog open onClose={handleUiRequestClose} className="position-relative">
+          <DialogBackdrop className="modal-backdrop fade show" />
+          <div className="modal fade show d-block position-fixed top-0 start-0 w-100 h-100" tabIndex={-1}>
+            <div className="modal-dialog modal-dialog-centered">
+              <DialogPanel className="modal-content">
+                <div className="modal-header">
+                  <DialogTitle as="h2" className="modal-title h5 mb-0">
+                    {activeUiRequest.title}
+                  </DialogTitle>
+                </div>
+                <div className="modal-body">
+                  {activeUiRequest.kind === 'approval' ? (
+                    <>
+                      <p className="mb-2">{activeUiRequest.description}</p>
+                      {activeUiRequest.command ? <pre className="form-control font-mono small mb-0">{activeUiRequest.command}</pre> : null}
+                    </>
+                  ) : (
+                    <div className="d-flex flex-column gap-3">
+                      {activeUiRequest.questions.map((question) => (
+                        <div key={question.id}>
+                          <label className="form-label small fw-semibold">{question.question}</label>
+                          <input
+                            className="form-control form-control-sm"
+                            list={`ui-question-options-${question.id}`}
+                            value={uiAnswers[question.id] ?? defaultAnswerForQuestion(question)}
+                            onChange={(event) =>
+                              setUiAnswers((current) => ({
+                                ...current,
+                                [question.id]: event.target.value,
+                              }))
+                            }
+                          />
+                          {question.options.length > 0 ? (
+                            <datalist id={`ui-question-options-${question.id}`}>
+                              {question.options.map((option) => (
+                                <option key={option} value={option} />
+                              ))}
+                            </datalist>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="modal-footer">
+                  {activeUiRequest.kind === 'approval' ? (
+                    <>
+                      <button type="button" className="btn btn-outline-secondary btn-sm" onClick={declineApprovalRequest}>
+                        Decline
+                      </button>
+                      <button type="button" className="btn btn-primary btn-sm" onClick={acceptApprovalRequest}>
+                        Approve
+                      </button>
+                    </>
+                  ) : (
+                    <button type="button" className="btn btn-primary btn-sm" onClick={submitUserInputRequest}>
+                      Submit
+                    </button>
+                  )}
+                </div>
+              </DialogPanel>
+            </div>
+          </div>
+        </Dialog>
+      ) : null}
     </>
   );
 }
