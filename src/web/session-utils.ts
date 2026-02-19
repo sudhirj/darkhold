@@ -1,10 +1,10 @@
-import { AgentEvent, SessionStatus } from './types';
+import { AgentEvent } from './types';
 
 export function roleForEvent(event: AgentEvent): 'user' | 'assistant' | 'system' {
   if (event.type === 'user.input') {
     return 'user';
   }
-  if (event.type === 'item.completed') {
+  if (event.type === 'assistant.output') {
     return 'assistant';
   }
   return 'system';
@@ -14,7 +14,7 @@ export function isConversationEvent(event: AgentEvent): boolean {
   if (event.type === 'user.input') {
     return true;
   }
-  if (event.type === 'item.completed') {
+  if (event.type === 'assistant.output') {
     return event.message.trim().length > 0;
   }
   if (event.type === 'turn.error') {

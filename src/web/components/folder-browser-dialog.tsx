@@ -1,6 +1,5 @@
 import React from 'react';
 import {
-  Button,
   Combobox,
   ComboboxInput,
   ComboboxOption,
@@ -97,6 +96,7 @@ export function FolderBrowserDialog({
                   const directories = filterDirectories(folderCache, columnSearch, listingPath);
                   const allDirectories = directoriesFor(folderCache, listingPath);
                   const selectedPath = columnSelections[listingPath] ?? null;
+                  const openTargetPath = selectedPath ?? listingPath;
                   const searchId = `folder-search-${columnIndex}`;
 
                   return (
@@ -160,18 +160,23 @@ export function FolderBrowserDialog({
                             </div>
                           </Combobox>
                         </div>
-                        <Button
-                          as="button"
+                        <button
                           type="button"
                           tabIndex={0}
                           className="btn btn-sm btn-outline-primary"
-                          onClick={() => void onOpenAgentForPath(listingPath)}
+                          onClick={() => void onOpenAgentForPath(openTargetPath)}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault();
+                              void onOpenAgentForPath(openTargetPath);
+                            }
+                          }}
                           disabled={!listing}
                           aria-label={`Open agent for combobox ${columnIndex + 1}`}
                           title="Open agent"
                         >
                           <i className="bi bi-robot" aria-hidden="true" />
-                        </Button>
+                        </button>
                       </div>
                     </section>
                   );

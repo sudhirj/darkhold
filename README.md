@@ -51,6 +51,8 @@ Darkhold server startup accepts:
   Example: `127.0.0.1` (localhost only), `0.0.0.0` (all IPv4 interfaces).
 - `--port`: TCP port to listen on.
   Default is `3275`.
+- `--rpc-port`: TCP port for the Codex app-server WebSocket endpoint.
+  Default is `3276`.
 - `--allow-cidr`: Allowlist of remote IPv4 CIDRs.
   You can pass this flag multiple times. Loopback (`127.0.0.1` / `::1`) is always allowed.
 
@@ -82,11 +84,10 @@ Output binary path:
 
 - Server has no built-in auth (intended for localhost or trusted private network access such as Tailscale).
 - Folder browsing is restricted to the user home directory.
+- Codex session/turn lifecycle is handled over JSON-RPC WebSockets via `codex app-server`, proxied through the Darkhold server.
 
 ## Useful Endpoints
 
 - `GET /api/health`
 - `GET /api/fs/list?path=/optional/path`
-- `POST /api/agents/start`
-- `GET /api/agents/:id`
-- `POST /api/agents/:id/input`
+- `GET /api/rpc/ws` (WebSocket upgrade endpoint for app-server RPC proxy)

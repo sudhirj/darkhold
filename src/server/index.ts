@@ -1,20 +1,66 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { AgentManager } from '../agent/agent-manager';
+import { ChildProcess, spawn } from 'node:child_process';
 import { getHomeRoot, listFolder, setBrowserRoot } from '../fs/home-browser';
 
 type ServerConfig = {
   bind: string;
   port: number;
+  rpcPort: number;
   allowCidrs: string[];
   basePath?: string;
 };
 
-const manager = new AgentManager();
+type WsProxyData = {
+  connectionId: number;
+  clientMessageCount: number;
+  appServerMessageCount: number;
+  appServer: ChildProcess | null;
+  stdoutBuffer: string;
+};
+
+function normalizeRpcPayload(payload: string | ArrayBuffer | Uint8Array): string {
+  if (typeof payload === 'string') {
+    return payload;
+  }
+  if (payload instanceof ArrayBuffer) {
+    return Buffer.from(payload).toString('utf8');
+  }
+  return Buffer.from(payload).toString('utf8');
+}
+
+function tapRpcFrame(direction: 'client->app-server' | 'app-server->client', payload: string | ArrayBuffer | Uint8Array) {
+  if (process.env.DARKHOLD_RPC_TAP !== '1') {
+    return;
+  }
+
+  const text = normalizeRpcPayload(payload);
+  let summary = text;
+  try {
+    const parsed = JSON.parse(text) as { method?: string; id?: number | string | null };
+    if (typeof parsed.method === 'string') {
+      summary = `method=${parsed.method}${parsed.id !== undefined ? ` id=${String(parsed.id)}` : ''}`;
+    } else if (parsed.id !== undefined) {
+      summary = `response id=${String(parsed.id)}`;
+    }
+  } catch {
+    summary = text.length > 240 ? `${text.slice(0, 240)}...` : text;
+  }
+
+  console.log(`[rpc tap] ${direction} ${summary}`);
+}
+
+function logProxy(message: string) {
+  if (process.env.DARKHOLD_RPC_TAP !== '1') {
+    return;
+  }
+  console.log(`[rpc proxy] ${message}`);
+}
 
 function parseConfig(argv: string[]): ServerConfig {
   let bind = '127.0.0.1';
   let port = 3275;
+  let rpcPort = 3276;
   const allowCidrs: string[] = [];
   let basePath: string | undefined;
 
@@ -36,6 +82,15 @@ function parseConfig(argv: string[]): ServerConfig {
     }
     if (arg.startsWith('--port=')) {
       port = Number.parseInt(arg.split('=')[1] || '', 10);
+      continue;
+    }
+    if (arg === '--rpc-port' && argv[i + 1]) {
+      rpcPort = Number.parseInt(argv[i + 1], 10);
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--rpc-port=')) {
+      rpcPort = Number.parseInt(arg.split('=')[1] || '', 10);
       continue;
     }
     if (arg === '--allow-cidr' && argv[i + 1]) {
@@ -60,6 +115,12 @@ function parseConfig(argv: string[]): ServerConfig {
   if (!Number.isFinite(port) || port < 1 || port > 65535) {
     throw new Error('Port must be a number between 1 and 65535.');
   }
+  if (!Number.isFinite(rpcPort) || rpcPort < 1 || rpcPort > 65535) {
+    throw new Error('RPC port must be a number between 1 and 65535.');
+  }
+  if (port === rpcPort) {
+    throw new Error('HTTP server port and RPC server port must be different.');
+  }
 
   for (const cidr of allowCidrs) {
     if (!parseIpv4Cidr(cidr)) {
@@ -67,7 +128,7 @@ function parseConfig(argv: string[]): ServerConfig {
     }
   }
 
-  return { bind, port, allowCidrs, basePath };
+  return { bind, port, rpcPort, allowCidrs, basePath };
 }
 
 function normalizeIpv4Address(address: string): string | null {
@@ -127,9 +188,12 @@ function cidrContains(address: string, cidr: string): boolean {
 
 function isAllowedClient(address: string | null, allowedCidrs: string[]): boolean {
   if (!address) {
-    return allowedCidrs.length === 0;
+    return true;
   }
   if (isLoopback(address)) {
+    return true;
+  }
+  if (address.startsWith('fd7a:115c:a1e0:')) {
     return true;
   }
   if (allowedCidrs.length === 0) {
@@ -208,29 +272,51 @@ async function buildFrontendBundle(): Promise<string> {
 
 const isDevLive = process.env.DARKHOLD_DEV === '1';
 
-async function readBody(req: Request): Promise<any> {
-  try {
-    return await req.json();
-  } catch {
-    return null;
-  }
-}
-
-function getSessionIdFromPath(url: URL): string | null {
-  const parts = url.pathname.split('/').filter(Boolean);
-  if (parts.length >= 3 && parts[0] === 'api' && parts[1] === 'agents') {
-    return parts[2] ?? null;
-  }
-  return null;
-}
-
 const config = parseConfig(process.argv.slice(2));
 await setBrowserRoot(config.basePath);
+let wsProxyConnectionCounter = 0;
+const activeAppServerChildren = new Set<ChildProcess>();
+
+function spawnAppServerForConnection(connectionId: number): ChildProcess {
+  const child = spawn('codex', ['app-server'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  activeAppServerChildren.add(child);
+  child.stderr.on('data', (chunk) => {
+    process.stderr.write(`[app-server conn=${connectionId}] ${String(chunk)}`);
+  });
+  child.on('exit', () => {
+    activeAppServerChildren.delete(child);
+  });
+  return child;
+}
+
+async function stopChildGracefully(child: ChildProcess, timeoutMs = 1500): Promise<void> {
+  if (child.exitCode !== null || child.killed) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      if (child.exitCode === null && !child.killed) {
+        child.kill('SIGKILL');
+      }
+      resolve();
+    }, timeoutMs);
+
+    child.once('exit', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+
+    child.kill('SIGTERM');
+  });
+}
+
 const [cachedIndexHtml, cachedStylesCss, cachedAppJs] = isDevLive
   ? [null, null, null]
   : await Promise.all([loadFrontendAsset('index.html'), loadFrontendAsset('styles.css'), buildFrontendBundle()]);
 
-const server = Bun.serve({
+const server = Bun.serve<WsProxyData>({
   hostname: config.bind,
   port: config.port,
   async fetch(req, server) {
@@ -245,71 +331,27 @@ const server = Bun.serve({
       return json({ ok: true, basePath: getHomeRoot() });
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/rpc/ws') {
+      const upgraded = server.upgrade(req, {
+        data: {
+          connectionId: 0,
+          clientMessageCount: 0,
+          appServerMessageCount: 0,
+          appServer: null,
+          stdoutBuffer: '',
+        },
+      });
+      if (upgraded) {
+        return;
+      }
+      return json({ error: 'WebSocket upgrade failed.' }, 400);
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/fs/list') {
       try {
         const requestedPath = url.searchParams.get('path') ?? undefined;
         const listing = await listFolder(requestedPath);
         return json(listing);
-      } catch (error: unknown) {
-        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
-      }
-    }
-
-    if (req.method === 'POST' && url.pathname === '/api/agents/start') {
-      const body = await readBody(req);
-      if (!body?.path || typeof body.path !== 'string') {
-        return json({ error: 'Body must include a folder path.' }, 400);
-      }
-      try {
-        const listing = await listFolder(body.path);
-        const session = manager.startSession(listing.path);
-        return json({ session }, 201);
-      } catch (error: unknown) {
-        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
-      }
-    }
-
-    if (req.method === 'GET' && url.pathname === '/api/agents') {
-      return json({ sessions: manager.listSessions() });
-    }
-
-    if (req.method === 'GET' && url.pathname.startsWith('/api/agents/')) {
-      const sessionId = getSessionIdFromPath(url);
-      if (!sessionId) {
-        return json({ error: 'Invalid session path.' }, 404);
-      }
-
-      if (url.pathname.endsWith('/events')) {
-        const sinceRaw = url.searchParams.get('since') ?? '0';
-        const since = Number.parseInt(sinceRaw, 10);
-        const events = manager.getEventsSince(sessionId, Number.isFinite(since) ? since : 0);
-        if (!events) {
-          return json({ error: 'Session not found.' }, 404);
-        }
-        return json({ events });
-      }
-
-      const session = manager.getSession(sessionId);
-      if (!session) {
-        return json({ error: 'Session not found.' }, 404);
-      }
-      return json({ session });
-    }
-
-    if (req.method === 'POST' && url.pathname.startsWith('/api/agents/')) {
-      const sessionId = getSessionIdFromPath(url);
-      if (!sessionId || !url.pathname.endsWith('/input')) {
-        return json({ error: 'Invalid input path.' }, 404);
-      }
-
-      const body = await readBody(req);
-      if (!body?.input || typeof body.input !== 'string') {
-        return json({ error: 'Body must include input text.' }, 400);
-      }
-
-      try {
-        manager.submitInput(sessionId, body.input);
-        return json({ accepted: true }, 202);
       } catch (error: unknown) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 400);
       }
@@ -345,8 +387,121 @@ const server = Bun.serve({
 
     return new Response('Not found', { status: 404 });
   },
+  websocket: {
+    open(ws) {
+      const connectionId = ++wsProxyConnectionCounter;
+      ws.data.connectionId = connectionId;
+      ws.data.clientMessageCount = 0;
+      ws.data.appServerMessageCount = 0;
+      ws.data.stdoutBuffer = '';
+
+      logProxy(`conn=${connectionId} client websocket opened`);
+      const appServer = spawnAppServerForConnection(connectionId);
+      ws.data.appServer = appServer;
+
+      if (!appServer.stdout) {
+        logProxy(`conn=${connectionId} app-server stdout unavailable`);
+        ws.close(1011, 'app-server stdout unavailable');
+        return;
+      }
+
+      appServer.stdout.on('data', (chunk) => {
+        ws.data.stdoutBuffer += String(chunk);
+        while (true) {
+          const newlineIndex = ws.data.stdoutBuffer.indexOf('\n');
+          if (newlineIndex < 0) {
+            break;
+          }
+          const line = ws.data.stdoutBuffer.slice(0, newlineIndex).trim();
+          ws.data.stdoutBuffer = ws.data.stdoutBuffer.slice(newlineIndex + 1);
+          if (!line) {
+            continue;
+          }
+          ws.data.appServerMessageCount += 1;
+          tapRpcFrame('app-server->client', line);
+          if (ws.readyState === 1) {
+            ws.send(line);
+          }
+        }
+      });
+
+      appServer.on('exit', (code, signal) => {
+        logProxy(`conn=${connectionId} app-server exited code=${code ?? 'null'} signal=${signal ?? 'null'}`);
+        ws.data.appServer = null;
+        if (ws.readyState === 1) {
+          ws.close(1011, 'app-server exited');
+        }
+      });
+    },
+    message(ws, message) {
+      const connectionId = ws.data.connectionId;
+      const appServer = ws.data.appServer;
+      if (!appServer || appServer.exitCode !== null || appServer.killed || !appServer.stdin) {
+        logProxy(`conn=${connectionId} dropping client message because app-server is unavailable`);
+        return;
+      }
+      ws.data.clientMessageCount += 1;
+      const payload = normalizeRpcPayload(message as any);
+      tapRpcFrame('client->app-server', payload);
+      appServer.stdin.write(payload.endsWith('\n') ? payload : `${payload}\n`);
+    },
+    close(ws) {
+      const connectionId = ws.data.connectionId;
+      logProxy(
+        `conn=${connectionId} client websocket closed stats(client->app-server=${ws.data.clientMessageCount}, app-server->client=${ws.data.appServerMessageCount})`,
+      );
+      const appServer = ws.data.appServer;
+      ws.data.appServer = null;
+      if (appServer) {
+        void stopChildGracefully(appServer);
+      }
+      ws.data.stdoutBuffer = '';
+    },
+  },
 });
 
 const allowListNote =
   config.allowCidrs.length > 0 ? ` (allowed CIDRs: ${config.allowCidrs.join(', ')}, plus localhost)` : '';
-console.log(`darkhold listening on http://${config.bind}:${server.port}${allowListNote} (base path: ${getHomeRoot()})`);
+console.log(
+  `darkhold listening on http://${config.bind}:${server.port}${allowListNote} (base path: ${getHomeRoot()}, app-server transport: stdio per websocket)`,
+);
+
+let shutdownStarted = false;
+
+async function stopAppServerGracefully(timeoutMs = 2500): Promise<void> {
+  await Promise.allSettled([...activeAppServerChildren].map((child) => stopChildGracefully(child, timeoutMs)));
+}
+
+async function shutdown(signal: NodeJS.Signals) {
+  if (shutdownStarted) {
+    return;
+  }
+  shutdownStarted = true;
+  console.log(`received ${signal}, shutting down...`);
+
+  server.stop(true);
+  await stopAppServerGracefully();
+  process.exit(0);
+}
+
+process.once('SIGINT', () => {
+  void shutdown('SIGINT');
+});
+process.once('SIGTERM', () => {
+  void shutdown('SIGTERM');
+});
+process.once('uncaughtException', (error) => {
+  console.error('uncaught exception, shutting down:', error);
+  void shutdown('SIGTERM');
+});
+process.once('unhandledRejection', (reason) => {
+  console.error('unhandled rejection, shutting down:', reason);
+  void shutdown('SIGTERM');
+});
+process.once('exit', () => {
+  for (const child of activeAppServerChildren) {
+    if (child.exitCode === null && !child.killed) {
+      child.kill('SIGKILL');
+    }
+  }
+});

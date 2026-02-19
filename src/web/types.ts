@@ -24,13 +24,19 @@ export type Session = {
   id: string;
   cwd: string;
   status: SessionStatus;
-  createdAt: string;
   updatedAt: string;
-  threadId: string | null;
+  threadId: string;
   latestEventSeq: number;
   progress: {
     completedItems: number;
     lastEventType: string | null;
   };
   events: AgentEvent[];
+};
+
+export type SessionSummary = {
+  id: string;
+  cwd: string;
+  status: SessionStatus;
+  updatedAt: string;
 };

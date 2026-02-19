@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p .tmp
+
+DARKHOLD_RPC_TAP="${DARKHOLD_RPC_TAP:-1}" \
+  bun --hot --no-clear-screen src/server/index.ts -- \
+    --bind 0.0.0.0 \
+    --port 3275 \
+    --rpc-port 3276 \
+    --allow-cidr 100.64.0.0/10 \
+  2>&1 | tee .tmp/dev-hot.log
