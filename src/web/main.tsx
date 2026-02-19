@@ -99,6 +99,11 @@ function defaultAnswerForQuestion(question: UserInputQuestion): string {
   return question.options.length > 0 ? question.options[0] : '';
 }
 
+function isThreadNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.toLowerCase().includes('thread not found');
+}
+
 function summarizeThreadItem(item: any): { type: string; message: string } | null {
   if (!item || typeof item !== 'object' || typeof item.type !== 'string') {
     return null;
@@ -700,11 +705,18 @@ function App() {
 
     const activeThreadId = activeThreadIdRef.current;
     if (activeThreadId) {
-      const response = await rpc.request<ThreadReadResponse>('thread/read', {
-        threadId: activeThreadId,
-        includeTurns: true,
-      });
-      setSession(buildSessionFromThreadRead(response));
+      try {
+        const resumed = await rpc.request<ThreadReadResponse>('thread/resume', {
+          threadId: activeThreadId,
+        });
+        setSession(buildSessionFromThreadRead(resumed));
+      } catch {
+        const response = await rpc.request<ThreadReadResponse>('thread/read', {
+          threadId: activeThreadId,
+          includeTurns: true,
+        });
+        setSession(buildSessionFromThreadRead(response));
+      }
     }
   }
 
@@ -854,10 +866,17 @@ function App() {
 
     try {
       setError(null);
-      const response = await rpc.request<ThreadReadResponse>('thread/read', {
-        threadId,
-        includeTurns: true,
-      });
+      let response: ThreadReadResponse;
+      try {
+        response = await rpc.request<ThreadReadResponse>('thread/resume', {
+          threadId,
+        });
+      } catch {
+        response = await rpc.request<ThreadReadResponse>('thread/read', {
+          threadId,
+          includeTurns: true,
+        });
+      }
       const loaded = buildSessionFromThreadRead(response);
       setSession(loaded);
       await refreshSessions();
@@ -878,10 +897,9 @@ function App() {
     try {
       setError(null);
       setPrompt('');
-      pushEventToSession(session.threadId, 'user.input', input);
       setThreadStatus(session.threadId, 'running');
 
-      await rpc.request('turn/start', {
+      const turnParams = {
         threadId: session.threadId,
         input: [
           {
@@ -890,7 +908,17 @@ function App() {
             text_elements: [],
           },
         ],
-      });
+      };
+
+      try {
+        await rpc.request('turn/start', turnParams);
+      } catch (error: unknown) {
+        if (!isThreadNotFoundError(error)) {
+          throw error;
+        }
+        await rpc.request('thread/resume', { threadId: session.threadId });
+        await rpc.request('turn/start', turnParams);
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
