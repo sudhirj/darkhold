@@ -49,6 +49,7 @@ Standardize on Bun scripts in `package.json`:
 ## Commit & Pull Request Guidelines
 - Use imperative commits with scope: `server: add bind option`, `web: render thread progress`.
 - Keep each commit focused on one concern (server, agent, or UI).
+- Do not commit or push unless the user explicitly asks for it in the current conversation.
 - PRs should include:
   - Goal and user-visible behavior.
   - API or protocol changes.
