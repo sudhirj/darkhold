@@ -1,5 +1,6 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
 import { jsonFetch } from './api';
 import { FolderBrowserDialog } from './components/folder-browser-dialog';
 import { AgentThreadPanel } from './components/agent-thread-panel';
@@ -22,6 +23,7 @@ function App() {
   const suppressNextAutoFocusRef = useRef(false);
   const [pendingFocusPath, setPendingFocusPath] = useState<string | null>(null);
   const activeSessionId = session?.id ?? '';
+  const selectorLabel = session ? `${session.id.slice(0, 8)} · ${session.cwd}` : 'Select session';
 
   const basePath = columnPaths.length > 0 ? (folderCache[columnPaths[0]]?.root ?? null) : null;
 
@@ -196,19 +198,65 @@ function App() {
     <>
       <nav className="navbar bg-body-tertiary border-bottom fixed-top">
         <div className="container">
-          <span className="navbar-brand mb-0 h1">Darkhold Agent Host</span>
-          <button
-            className="btn btn-primary btn-sm"
-            type="button"
-            tabIndex={0}
-            onClick={openFolderBrowser}
-            aria-controls="folderBrowserPanel"
-            aria-expanded={isFolderBrowserOpen}
-            aria-label="Open folder browser"
-            title="Open folder browser"
-          >
-            <i className="bi bi-folder2-open" aria-hidden="true" />
-          </button>
+          <div className="d-flex align-items-center gap-2 w-100">
+            {sessions.length > 0 ? (
+              <Listbox
+                value={activeSessionId}
+                onChange={(nextSessionId) => {
+                  if (nextSessionId) {
+                    void resumeSession(nextSessionId);
+                  }
+                }}
+              >
+                <div className="position-relative flex-grow-1 min-w-0">
+                  <ListboxButton
+                    className="form-select form-select-sm text-start w-100 focus-ring focus-ring-primary"
+                    aria-label="Select active session"
+                    tabIndex={0}
+                  >
+                    <span className="text-truncate d-block w-100 pe-4">{selectorLabel}</span>
+                  </ListboxButton>
+                  <ListboxOptions className="position-absolute start-0 mt-1 w-100 border rounded bg-white shadow-sm p-1 z-3 folder-list">
+                    {sessions.map((item) => (
+                      <ListboxOption
+                        key={item.id}
+                        value={item.id}
+                        className={({ focus, selected }) =>
+                          `list-group-item border-0 rounded px-2 py-2 ${
+                            selected ? 'active' : focus ? 'list-group-item-primary' : 'list-group-item-action'
+                          }`
+                        }
+                      >
+                        <div className="d-flex align-items-start justify-content-between gap-2">
+                          <div className="text-start min-w-0">
+                            <div className="small font-mono fw-semibold">{item.id.slice(0, 8)}</div>
+                            <div className="small text-secondary text-truncate">{item.cwd}</div>
+                          </div>
+                          {item.id === activeSessionId ? <i className="bi bi-check2 mt-1" aria-hidden="true" /> : null}
+                        </div>
+                      </ListboxOption>
+                    ))}
+                  </ListboxOptions>
+                </div>
+              </Listbox>
+            ) : (
+              <button className="form-select form-select-sm text-start w-100" type="button" disabled>
+                <span className="d-block text-secondary pe-4">No active sessions</span>
+              </button>
+            )}
+            <button
+              className="btn btn-primary btn-sm"
+              type="button"
+              tabIndex={0}
+              onClick={openFolderBrowser}
+              aria-controls="folderBrowserPanel"
+              aria-expanded={isFolderBrowserOpen}
+              aria-label="Open folder browser"
+              title="Open folder browser"
+            >
+              <i className="bi bi-folder2-open" aria-hidden="true" />
+            </button>
+          </div>
         </div>
       </nav>
 
@@ -237,14 +285,11 @@ function App() {
         <div className="row g-3">
           <AgentThreadPanel
             session={session}
-            sessions={sessions}
-            activeSessionId={activeSessionId}
             conversationEvents={conversationEvents}
             transientProgressEvents={transientProgressEvents}
             conversationEndRef={conversationEndRef}
             promptInputRef={promptInputRef}
             prompt={prompt}
-            onResumeSession={resumeSession}
             onSubmitPrompt={submitPrompt}
             onPromptKeyDown={handlePromptKeyDown}
             onPromptChange={setPrompt}

@@ -1,15 +1,5 @@
 import { AgentEvent, SessionStatus } from './types';
 
-export function statusClass(status: SessionStatus): string {
-  if (status === 'running') {
-    return 'text-bg-success';
-  }
-  if (status === 'error') {
-    return 'text-bg-danger';
-  }
-  return 'text-bg-secondary';
-}
-
 export function roleForEvent(event: AgentEvent): 'user' | 'assistant' | 'system' {
   if (event.type === 'user.input') {
     return 'user';
