@@ -104,6 +104,22 @@ function isThreadNotFoundError(error: unknown): boolean {
   return message.toLowerCase().includes('thread not found');
 }
 
+function readSessionIdFromUrl(): string | null {
+  const params = new URLSearchParams(window.location.search);
+  const sessionId = params.get('session');
+  return sessionId && sessionId.trim().length > 0 ? sessionId : null;
+}
+
+function writeSessionIdToUrl(sessionId: string | null) {
+  const url = new URL(window.location.href);
+  if (sessionId) {
+    url.searchParams.set('session', sessionId);
+  } else {
+    url.searchParams.delete('session');
+  }
+  window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+}
+
 function summarizeThreadItem(item: any): { type: string; message: string } | null {
   if (!item || typeof item !== 'object' || typeof item.type !== 'string') {
     return null;
@@ -703,19 +719,21 @@ function App() {
 
     await refreshSessions(rpc);
 
-    const activeThreadId = activeThreadIdRef.current;
+    const activeThreadId = activeThreadIdRef.current ?? readSessionIdFromUrl();
     if (activeThreadId) {
       try {
         const resumed = await rpc.request<ThreadReadResponse>('thread/resume', {
           threadId: activeThreadId,
         });
         setSession(buildSessionFromThreadRead(resumed));
+        writeSessionIdToUrl(activeThreadId);
       } catch {
         const response = await rpc.request<ThreadReadResponse>('thread/read', {
           threadId: activeThreadId,
           includeTurns: true,
         });
         setSession(buildSessionFromThreadRead(response));
+        writeSessionIdToUrl(activeThreadId);
       }
     }
   }
@@ -851,6 +869,7 @@ function App() {
       };
 
       setSession(nextSession);
+      writeSessionIdToUrl(nextSession.threadId);
       setIsFolderBrowserOpen(false);
       await refreshSessions();
     } catch (err: unknown) {
@@ -858,7 +877,7 @@ function App() {
     }
   }
 
-  async function resumeSession(threadId: string) {
+  async function resumeSession(threadId: string, options?: { updateUrl?: boolean }) {
     const rpc = rpcRef.current;
     if (!rpc) {
       return;
@@ -879,8 +898,14 @@ function App() {
       }
       const loaded = buildSessionFromThreadRead(response);
       setSession(loaded);
+      if (options?.updateUrl !== false) {
+        writeSessionIdToUrl(threadId);
+      }
       await refreshSessions();
     } catch (err: unknown) {
+      if (options?.updateUrl !== false && isThreadNotFoundError(err)) {
+        writeSessionIdToUrl(null);
+      }
       setError(err instanceof Error ? err.message : String(err));
     }
   }
