@@ -795,7 +795,7 @@ function App() {
   return (
     <>
       <nav className="navbar bg-body-tertiary border-bottom fixed-top">
-        <div className="container">
+        <div className="container-fluid px-3">
           <div className="d-flex align-items-center gap-2 w-100">
             {sessions.length > 0 ? (
               <Listbox
@@ -878,21 +878,19 @@ function App() {
         onOpenAgentForPath={startSessionForPath}
       />
 
-      <main className="container py-4">
+      <main className="container-fluid px-3 py-3">
         {error ? <div className="alert alert-danger">{error}</div> : null}
-        <div className="row g-3">
-          <AgentThreadPanel
-            session={session}
-            conversationEvents={conversationEvents}
-            transientProgressEvents={transientProgressEvents}
-            conversationEndRef={conversationEndRef}
-            promptInputRef={promptInputRef}
-            prompt={prompt}
-            onSubmitPrompt={submitPrompt}
-            onPromptKeyDown={handlePromptKeyDown}
-            onPromptChange={setPrompt}
-          />
-        </div>
+        <AgentThreadPanel
+          session={session}
+          conversationEvents={conversationEvents}
+          transientProgressEvents={transientProgressEvents}
+          conversationEndRef={conversationEndRef}
+          promptInputRef={promptInputRef}
+          prompt={prompt}
+          onSubmitPrompt={submitPrompt}
+          onPromptKeyDown={handlePromptKeyDown}
+          onPromptChange={setPrompt}
+        />
       </main>
     </>
   );

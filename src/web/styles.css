@@ -1,6 +1,7 @@
 :root {
   --font-ui: 'IBM Plex Sans', sans-serif;
   --font-mono: 'IBM Plex Mono', monospace;
+  --prompt-dock-height: 11rem;
 }
 
 html,
@@ -15,6 +16,7 @@ body {
   font-family: var(--font-ui);
   background: transparent;
   padding-top: 3rem;
+  padding-bottom: calc(var(--prompt-dock-height) + env(safe-area-inset-bottom));
 }
 
 code,
@@ -31,7 +33,9 @@ input,
 }
 
 .event-log {
-  max-height: 420px;
-  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
+.chat-text {
   white-space: pre-wrap;
 }
