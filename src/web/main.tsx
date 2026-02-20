@@ -174,13 +174,36 @@ function summarizeThreadItem(item: any): { type: string; message: string } | nul
   };
 }
 
+function syntheticReadTurnId(threadId: string, turnIndex: number): string {
+  return `read-turn:${threadId}:${turnIndex}`;
+}
+
+function extractTurnId(payload: any): string | null {
+  if (typeof payload?.turnId === 'string') {
+    return payload.turnId;
+  }
+  if (typeof payload?.turn?.id === 'string') {
+    return payload.turn.id;
+  }
+  return null;
+}
+
+function nextCompletedTurnNumber(current: Session | null, threadId: string): number {
+  if (!current || current.threadId !== threadId) {
+    return 1;
+  }
+  return current.events.filter((event) => event.type === 'turn.completed').length + 1;
+}
+
 function buildSessionFromThreadRead(response: ThreadReadResponse): Session {
   const events: AgentEvent[] = [];
   let seq = 0;
   let completedItems = 0;
   let lastEventType: string | null = null;
 
-  for (const turn of response.thread.turns) {
+  for (let turnIndex = 0; turnIndex < response.thread.turns.length; turnIndex += 1) {
+    const turn = response.thread.turns[turnIndex];
+    const turnId = syntheticReadTurnId(response.thread.id, turnIndex);
     for (const item of turn.items) {
       const summary = summarizeThreadItem(item);
       if (!summary) {
@@ -192,6 +215,7 @@ function buildSessionFromThreadRead(response: ThreadReadResponse): Session {
         timestamp: nowIso(),
         type: summary.type,
         message: summary.message,
+        turnId,
       });
       lastEventType = summary.type;
       if (summary.type === 'assistant.output') {
@@ -206,13 +230,26 @@ function buildSessionFromThreadRead(response: ThreadReadResponse): Session {
         timestamp: nowIso(),
         type: 'turn.error',
         message: turn.error.message,
+        turnId,
       });
       lastEventType = 'turn.error';
     }
+
+    seq += 1;
+    events.push({
+      seq,
+      timestamp: nowIso(),
+      type: 'turn.completed',
+      message: `${turnIndex + 1}`,
+      turnId,
+    });
+    lastEventType = 'turn.completed';
   }
 
   const lastTurn = response.thread.turns[response.thread.turns.length - 1];
   const status = lastTurn ? statusFromTurnStatus(lastTurn.status) : 'idle';
+  const currentTurnId =
+    lastTurn?.status === 'inProgress' ? syntheticReadTurnId(response.thread.id, response.thread.turns.length - 1) : null;
 
   return {
     id: response.thread.id,
@@ -220,6 +257,7 @@ function buildSessionFromThreadRead(response: ThreadReadResponse): Session {
     status,
     updatedAt: unixSecondsToIso(response.thread.updatedAt),
     threadId: response.thread.id,
+    currentTurnId,
     latestEventSeq: seq,
     progress: {
       completedItems,
@@ -424,10 +462,14 @@ function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [session, setSession] = useState<Session | null>(null);
   const [isFolderBrowserOpen, setIsFolderBrowserOpen] = useState(false);
+  const [isThinkingDialogOpen, setIsThinkingDialogOpen] = useState(false);
   const [prompt, setPrompt] = useState('');
   const [activeUiRequest, setActiveUiRequest] = useState<PendingUiRequest | null>(null);
   const [uiAnswers, setUiAnswers] = useState<Record<string, string>>({});
+  const [isSentinelInView, setIsSentinelInView] = useState(false);
+  const [promptDockHeightPx, setPromptDockHeightPx] = useState(0);
   const conversationEndRef = useRef<HTMLDivElement | null>(null);
+  const promptDockRef = useRef<HTMLFormElement | null>(null);
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const folderInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const suppressNextAutoFocusRef = useRef(false);
@@ -435,6 +477,8 @@ function App() {
   const rpcRef = useRef<RpcClient | null>(null);
   const activeThreadIdRef = useRef<string | null>(null);
   const queuedUiRequestsRef = useRef<PendingUiRequest[]>([]);
+  const shouldStickToBottomRef = useRef(true);
+  const activeTurnByThreadRef = useRef<Map<string, string>>(new Map());
 
   const activeSessionId = session?.id ?? '';
   const selectorLabel = session ? `${session.id.slice(0, 8)} · ${session.cwd}` : 'Select session';
@@ -446,13 +490,17 @@ function App() {
     [session?.events],
   );
 
-  const transientProgressEvents = useMemo(
+  const thinkingEvents = useMemo(
     () =>
-      session?.status === 'running'
-        ? (session.events ?? []).filter((event) => isTransientProgressEvent(event)).slice(-5)
+      session?.currentTurnId
+        ? (session.events ?? [])
+            .filter((event) => event.turnId === session.currentTurnId && isTransientProgressEvent(event))
+            .slice(-200)
         : [],
-    [session?.status, session?.events],
+    [session?.currentTurnId, session?.events],
   );
+
+  const isLiveWorkActive = session?.status === 'running';
 
   useEffect(() => {
     void initializeFolderBrowser();
@@ -480,8 +528,71 @@ function App() {
   }, []);
 
   useEffect(() => {
-    conversationEndRef.current?.scrollIntoView({ block: 'end' });
-  }, [session?.latestEventSeq]);
+    const promptDock = promptDockRef.current;
+    if (!promptDock) {
+      return;
+    }
+
+    const rootStyle = document.documentElement.style;
+    const updatePromptDockHeight = () => {
+      const measuredHeight = promptDock.getBoundingClientRect().height;
+      rootStyle.setProperty('--prompt-dock-height', `${measuredHeight}px`);
+      setPromptDockHeightPx(measuredHeight);
+    };
+
+    updatePromptDockHeight();
+
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updatePromptDockHeight);
+      return () => {
+        window.removeEventListener('resize', updatePromptDockHeight);
+      };
+    }
+
+    const observer = new ResizeObserver(() => {
+      updatePromptDockHeight();
+    });
+    observer.observe(promptDock);
+    return () => {
+      observer.disconnect();
+    };
+  }, [session?.id]);
+
+  useEffect(() => {
+    if (!session) {
+      shouldStickToBottomRef.current = true;
+      setIsSentinelInView(false);
+      return;
+    }
+    const sentinel = conversationEndRef.current;
+    if (!sentinel || typeof IntersectionObserver === 'undefined') {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const isInView = entries.some((entry) => entry.isIntersecting);
+        shouldStickToBottomRef.current = isInView;
+        setIsSentinelInView(isInView);
+      },
+      {
+        threshold: 0.9,
+      },
+    );
+    observer.observe(sentinel);
+    return () => {
+      observer.disconnect();
+    };
+  }, [session?.id]);
+
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+    requestAnimationFrame(() => {
+      conversationEndRef.current?.scrollIntoView({ block: 'end', inline: 'nearest' });
+    });
+  }, [session?.id, session?.latestEventSeq]);
 
   useEffect(() => {
     activeThreadIdRef.current = session?.threadId ?? null;
@@ -525,14 +636,15 @@ function App() {
     return listing.entries.filter((entry) => entry.kind === 'directory');
   }
 
-  function pushEventToSession(threadId: string, type: string, message: string) {
+  function pushEventToSession(threadId: string, type: string, message: string, turnIdOverride?: string | null) {
+    const turnId = turnIdOverride ?? activeTurnByThreadRef.current.get(threadId) ?? null;
     setSession((current) => {
       if (!current || current.threadId !== threadId) {
         return current;
       }
 
       const seq = current.latestEventSeq + 1;
-      const nextEvents = [...current.events, { seq, timestamp: nowIso(), type, message }];
+      const nextEventsWithTurn = [...current.events, { seq, timestamp: nowIso(), type, message, turnId }];
       const nextProgress = {
         completedItems: type === 'assistant.output' ? current.progress.completedItems + 1 : current.progress.completedItems,
         lastEventType: type,
@@ -542,8 +654,25 @@ function App() {
         ...current,
         latestEventSeq: seq,
         updatedAt: nowIso(),
-        events: nextEvents,
+        events: nextEventsWithTurn,
         progress: nextProgress,
+      };
+    });
+  }
+
+  function setThreadCurrentTurn(threadId: string, turnId: string | null) {
+    if (turnId) {
+      activeTurnByThreadRef.current.set(threadId, turnId);
+    } else {
+      activeTurnByThreadRef.current.delete(threadId);
+    }
+    setSession((current) => {
+      if (!current || current.threadId !== threadId) {
+        return current;
+      }
+      return {
+        ...current,
+        currentTurnId: turnId,
       };
     });
   }
@@ -662,16 +791,25 @@ function App() {
     const payload = (params ?? {}) as any;
 
     if (method === 'turn/started' && typeof payload.threadId === 'string') {
+      const turnId = extractTurnId(payload) ?? `live-turn:${payload.threadId}:${Date.now()}`;
+      setThreadCurrentTurn(payload.threadId, turnId);
       setThreadStatus(payload.threadId, 'running');
       return;
     }
 
     if (method === 'turn/completed' && typeof payload.threadId === 'string') {
+      const completedTurnId = extractTurnId(payload);
+      const activeTurnId = activeTurnByThreadRef.current.get(payload.threadId) ?? null;
+      const eventTurnId = completedTurnId ?? activeTurnId;
+      if (!completedTurnId || !activeTurnId || completedTurnId === activeTurnId) {
+        setThreadCurrentTurn(payload.threadId, null);
+      }
       const turnStatus = payload.turn?.status as string | undefined;
       const nextStatus: SessionStatus = turnStatus === 'failed' ? 'error' : 'idle';
+      pushEventToSession(payload.threadId, 'turn.completed', `${nextCompletedTurnNumber(session, payload.threadId)}`, eventTurnId);
       setThreadStatus(payload.threadId, nextStatus);
       if (nextStatus === 'error' && payload.turn?.error?.message) {
-        pushEventToSession(payload.threadId, 'turn.error', payload.turn.error.message);
+        pushEventToSession(payload.threadId, 'turn.error', payload.turn.error.message, eventTurnId);
       }
       void refreshSessions();
       return;
@@ -688,7 +826,7 @@ function App() {
       if (!summary) {
         return;
       }
-      pushEventToSession(payload.threadId, summary.type, summary.message);
+      pushEventToSession(payload.threadId, summary.type, summary.message, extractTurnId(payload));
       return;
     }
 
@@ -696,7 +834,7 @@ function App() {
       if (payload.threadId !== activeThreadIdRef.current) {
         return;
       }
-      pushEventToSession(payload.threadId, 'agent.delta', payload.delta);
+      pushEventToSession(payload.threadId, 'agent.delta', payload.delta, extractTurnId(payload));
       return;
     }
 
@@ -725,14 +863,18 @@ function App() {
         const resumed = await rpc.request<ThreadReadResponse>('thread/resume', {
           threadId: activeThreadId,
         });
-        setSession(buildSessionFromThreadRead(resumed));
+        const loaded = buildSessionFromThreadRead(resumed);
+        setSession(loaded);
+        setThreadCurrentTurn(activeThreadId, loaded.currentTurnId);
         writeSessionIdToUrl(activeThreadId);
       } catch {
         const response = await rpc.request<ThreadReadResponse>('thread/read', {
           threadId: activeThreadId,
           includeTurns: true,
         });
-        setSession(buildSessionFromThreadRead(response));
+        const loaded = buildSessionFromThreadRead(response);
+        setSession(loaded);
+        setThreadCurrentTurn(activeThreadId, loaded.currentTurnId);
         writeSessionIdToUrl(activeThreadId);
       }
     }
@@ -860,6 +1002,7 @@ function App() {
         status: 'idle',
         updatedAt: unixSecondsToIso(response.thread.updatedAt),
         threadId: response.thread.id,
+        currentTurnId: null,
         latestEventSeq: 0,
         progress: {
           completedItems: 0,
@@ -898,6 +1041,7 @@ function App() {
       }
       const loaded = buildSessionFromThreadRead(response);
       setSession(loaded);
+      setThreadCurrentTurn(threadId, loaded.currentTurnId);
       if (options?.updateUrl !== false) {
         writeSessionIdToUrl(threadId);
       }
@@ -1059,8 +1203,8 @@ function App() {
         <AgentThreadPanel
           session={session}
           conversationEvents={conversationEvents}
-          transientProgressEvents={transientProgressEvents}
           conversationEndRef={conversationEndRef}
+          promptDockRef={promptDockRef}
           promptInputRef={promptInputRef}
           prompt={prompt}
           onSubmitPrompt={submitPrompt}
@@ -1068,6 +1212,63 @@ function App() {
           onPromptChange={setPrompt}
         />
       </main>
+
+      {session ? (
+        <button
+          type="button"
+          className={`btn btn-light border shadow-sm thinking-fab d-inline-flex align-items-center gap-2 ${
+            isLiveWorkActive ? 'is-active' : ''
+          }`}
+          onClick={() => setIsThinkingDialogOpen(true)}
+          aria-label="Show thinking events"
+          title="Show thinking events"
+        >
+          <span className="spinner-border spinner-border-sm text-primary" aria-hidden="true" />
+          <span className="small fw-semibold">{thinkingEvents.length}</span>
+        </button>
+      ) : null}
+
+      <aside
+        className="position-fixed top-0 end-0 mt-5 me-3 p-2 border rounded bg-light shadow-sm font-mono small"
+        style={{ zIndex: 1055, minWidth: '220px', opacity: 0.9 }}
+        aria-label="Scroll debug panel"
+      >
+        <div className="fw-semibold mb-1">Debug</div>
+        <div>sentinelInView: {isSentinelInView ? 'yes' : 'no'}</div>
+        <div>promptDockHeight: {Math.round(promptDockHeightPx)}px</div>
+        <div>liveActive: {isLiveWorkActive ? 'yes' : 'no'}</div>
+      </aside>
+
+      {isThinkingDialogOpen ? (
+        <Dialog open onClose={() => setIsThinkingDialogOpen(false)} className="position-relative">
+          <DialogBackdrop className="modal-backdrop fade show" />
+          <div className="modal fade show d-block position-fixed top-0 start-0 w-100 h-100" tabIndex={-1}>
+            <div className="modal-dialog modal-dialog-scrollable modal-lg modal-dialog-centered">
+              <DialogPanel className="modal-content">
+                <div className="modal-header">
+                  <DialogTitle as="h2" className="modal-title h5 mb-0">
+                    Thinking Events
+                  </DialogTitle>
+                  <button type="button" className="btn-close" aria-label="Close" onClick={() => setIsThinkingDialogOpen(false)} />
+                </div>
+                <div className="modal-body">
+                  {thinkingEvents.length === 0 ? <p className="text-secondary mb-0">No thinking events yet.</p> : null}
+                  {thinkingEvents.length > 0 ? (
+                    <ul className="list-group">
+                      {thinkingEvents.map((event) => (
+                        <li key={event.seq} className="list-group-item">
+                          <div className="small font-mono text-secondary mb-1">{event.type}</div>
+                          <pre className="mb-0 chat-text">{event.message}</pre>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+              </DialogPanel>
+            </div>
+          </div>
+        </Dialog>
+      ) : null}
 
       {activeUiRequest ? (
         <Dialog open onClose={handleUiRequestClose} className="position-relative">

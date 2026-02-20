@@ -5,8 +5,8 @@ import { roleForEvent } from '../session-utils';
 type AgentThreadPanelProps = {
   session: Session | null;
   conversationEvents: AgentEvent[];
-  transientProgressEvents: AgentEvent[];
   conversationEndRef: React.RefObject<HTMLDivElement | null>;
+  promptDockRef: React.RefObject<HTMLFormElement | null>;
   promptInputRef: React.RefObject<HTMLTextAreaElement | null>;
   prompt: string;
   onSubmitPrompt: (event: FormEvent<HTMLFormElement>) => Promise<void>;
@@ -17,14 +17,27 @@ type AgentThreadPanelProps = {
 export function AgentThreadPanel({
   session,
   conversationEvents,
-  transientProgressEvents,
   conversationEndRef,
+  promptDockRef,
   promptInputRef,
   prompt,
   onSubmitPrompt,
   onPromptKeyDown,
   onPromptChange,
 }: AgentThreadPanelProps) {
+  const visibleConversationEvents = conversationEvents.filter((event) => event.type !== 'turn.completed');
+
+  const turnGroups = visibleConversationEvents.reduce<Array<{ key: string; events: AgentEvent[] }>>((groups, event) => {
+    const groupKey = event.turnId ?? `no-turn:${event.seq}`;
+    const current = groups[groups.length - 1];
+    if (!current || current.key !== groupKey) {
+      groups.push({ key: groupKey, events: [event] });
+      return groups;
+    }
+    current.events.push(event);
+    return groups;
+  }, []);
+
   const rowClassForRole = (role: 'user' | 'assistant' | 'system') => {
     if (role === 'user') {
       return 'list-group-item-primary';
@@ -52,50 +65,51 @@ export function AgentThreadPanel({
             {session.progress.lastEventType ? `, last event ${session.progress.lastEventType}` : ''}
           </div>
 
-          {transientProgressEvents.length > 0 ? (
-            <div className="alert alert-info py-2 mb-3" role="status">
-              <div className="small fw-semibold mb-1">Live progress</div>
-              <ul className="mb-0 ps-3">
-                {transientProgressEvents.map((agentEvent) => (
-                  <li key={agentEvent.seq} className="small">
-                    <span className="font-mono text-secondary me-1">{agentEvent.type}</span>
-                    {agentEvent.message}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-
-          <ul className="list-group event-log mb-3 chat-log">
-            {conversationEvents.length === 0 ? <li className="list-group-item text-secondary">No conversation yet.</li> : null}
-            {conversationEvents.map((agentEvent) => {
-              const role = roleForEvent(agentEvent);
-              return (
-                <li key={agentEvent.seq} className={`list-group-item ps-2 ${rowClassForRole(role)}`}>
-                  <div className="d-flex align-items-baseline">
-                    <div className="flex-shrink-0 me-2">
-                      <span
-                        className="d-inline-flex align-items-center justify-content-center rounded-circle bg-body border text-secondary"
-                        style={{ width: '1.75rem', height: '1.75rem' }}
-                        aria-hidden="true"
+          <ul className="list-group event-log chat-log">
+            {visibleConversationEvents.length === 0 ? <li className="list-group-item text-secondary">No conversation yet.</li> : null}
+            {turnGroups.map((group) => (
+              <li key={group.key} className="list-group-item border-0 bg-transparent p-0 mb-2">
+                <div className="turn-event-group rounded-3 border overflow-hidden">
+                  {group.events.map((agentEvent, index) => {
+                    const role = roleForEvent(agentEvent);
+                    return (
+                      <div
+                        key={agentEvent.seq}
+                        className={`ps-2 py-2 ${rowClassForRole(role)} ${index > 0 ? 'border-top' : ''} ${
+                          role === 'user' ? 'user-message-row' : ''
+                        }`}
                       >
-                        {role === 'user' ? <i className="bi bi-person-fill" /> : <i className="bi bi-robot" />}
-                      </span>
-                    </div>
-                    <div className="flex-grow-1">
-                      <pre className="mb-0 chat-text">{agentEvent.message}</pre>
-                    </div>
-                  </div>
-                </li>
-              );
-            })}
+                        <div className="d-flex align-items-baseline">
+                          <div className="flex-shrink-0 me-2">
+                            <span
+                              className="d-inline-flex align-items-center justify-content-center text-secondary"
+                              style={{ width: '1.75rem', height: '1.75rem' }}
+                              aria-hidden="true"
+                            >
+                              {role === 'user' ? <i className="bi bi-person-fill" style={{ opacity: 0.6 }} /> : <i className="bi bi-robot" style={{ opacity: 0.6 }} />}
+                            </span>
+                          </div>
+                          <div className="flex-grow-1">
+                            <pre className={`mb-0 chat-text ${role === 'user' ? 'user-message-text' : ''}`}>{agentEvent.message}</pre>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </li>
+            ))}
             <li className="list-group-item border-0 p-0" aria-hidden="true">
-              <div ref={conversationEndRef} />
+              <div className="event-log-bottom-spacer" />
+            </li>
+            <li className="list-group-item border-0 p-0" aria-hidden="true">
+              <div ref={conversationEndRef} className="event-log-bottom-sentinel" />
             </li>
           </ul>
 
           <form
-            className="position-fixed bottom-0 start-0 end-0 bg-body-tertiary border-top py-2"
+            ref={promptDockRef}
+            className="position-fixed bottom-0 start-0 end-0 bg-body-tertiary border-top py-2 prompt-dock"
             onSubmit={(event) => void onSubmitPrompt(event)}
           >
             <div className="container-fluid px-3 pb-2">

@@ -16,6 +16,7 @@ export type AgentEvent = {
   timestamp: string;
   type: string;
   message: string;
+  turnId: string | null;
 };
 
 export type SessionStatus = 'idle' | 'running' | 'error';
@@ -26,6 +27,7 @@ export type Session = {
   status: SessionStatus;
   updatedAt: string;
   threadId: string;
+  currentTurnId: string | null;
   latestEventSeq: number;
   progress: {
     completedItems: number;

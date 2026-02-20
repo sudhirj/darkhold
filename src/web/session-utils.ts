@@ -17,6 +17,9 @@ export function isConversationEvent(event: AgentEvent): boolean {
   if (event.type === 'assistant.output') {
     return event.message.trim().length > 0;
   }
+  if (event.type === 'turn.completed') {
+    return true;
+  }
   if (event.type === 'turn.error') {
     return true;
   }

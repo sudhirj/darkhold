@@ -16,7 +16,6 @@ body {
   font-family: var(--font-ui);
   background: transparent;
   padding-top: 3rem;
-  padding-bottom: calc(var(--prompt-dock-height) + env(safe-area-inset-bottom));
 }
 
 code,
@@ -36,6 +35,52 @@ input,
   white-space: pre-wrap;
 }
 
+.turn-event-group {
+  background-color: rgba(255, 255, 255, 0.72);
+}
+
+.event-log-bottom-spacer {
+  height: calc(var(--prompt-dock-height) + env(safe-area-inset-bottom));
+}
+
+.event-log-bottom-sentinel {
+  display: block;
+  width: 100%;
+  height: 1px;
+  background-color: #e91e63;
+  pointer-events: none;
+}
+
 .chat-text {
   white-space: pre-wrap;
+}
+
+.user-message-row {
+  border-bottom: 2px solid rgba(25, 135, 84, 0.22);
+}
+
+.user-message-text {
+  font-weight: 520;
+  opacity: 0.88;
+}
+
+.prompt-dock {
+  background-color: rgba(248, 249, 250, 0.72) !important;
+  backdrop-filter: blur(3px);
+}
+
+.thinking-fab {
+  position: fixed;
+  right: 1rem;
+  bottom: calc(var(--prompt-dock-height) + env(safe-area-inset-bottom) + 0.75rem);
+  z-index: 1058;
+  border-radius: 9999px;
+}
+
+.thinking-fab .spinner-border {
+  animation-play-state: paused;
+}
+
+.thinking-fab.is-active .spinner-border {
+  animation-play-state: running;
 }
