@@ -50,7 +50,10 @@ type session struct {
 	mu             sync.Mutex
 	pending        map[int64]chan map[string]any
 	knownThreadIDs map[string]struct{}
+	activeTurnIDs  map[string]struct{}
+	lastActivityAt time.Time
 	closed         bool
+	stopRequested  bool
 }
 
 type pendingInteraction struct {
@@ -64,6 +67,8 @@ type Server struct {
 	cfg config.Config
 
 	eventStore *events.Store
+	shutdownMu sync.Once
+	reaperStop chan struct{}
 
 	sessionsMu       sync.RWMutex
 	sessions         map[int]*session
@@ -77,18 +82,26 @@ type Server struct {
 	nextSSESubID   int
 
 	publishMu sync.Mutex
+
+	sessionIdleTTL      time.Duration
+	sessionReapInterval time.Duration
 }
 
 func New(cfg config.Config, eventStore *events.Store) *Server {
-	return &Server{
-		cfg:              cfg,
-		eventStore:       eventStore,
-		sessions:         map[int]*session{},
-		threadToSession:  map[string]int{},
-		pendingResponses: map[string]map[string]pendingInteraction{},
-		sseSubs:          map[string]map[int]chan string{},
-		sseNextEventID:   map[string]int{},
+	s := &Server{
+		cfg:                 cfg,
+		eventStore:          eventStore,
+		reaperStop:          make(chan struct{}),
+		sessions:            map[int]*session{},
+		threadToSession:     map[string]int{},
+		pendingResponses:    map[string]map[string]pendingInteraction{},
+		sseSubs:             map[string]map[int]chan string{},
+		sseNextEventID:      map[string]int{},
+		sessionIdleTTL:      5 * time.Minute,
+		sessionReapInterval: 5 * time.Second,
 	}
+	go s.sessionIdleReaper()
+	return s
 }
 
 func (s *Server) Handler() http.Handler {
@@ -534,12 +547,15 @@ func (s *Server) spawnSession() (*session, error) {
 
 	s.sessionsMu.Lock()
 	s.nextSessionID++
+	now := time.Now()
 	sess := &session{
 		id:             s.nextSessionID,
 		cmd:            cmd,
 		stdin:          stdin,
 		pending:        map[int64]chan map[string]any{},
 		knownThreadIDs: map[string]struct{}{},
+		activeTurnIDs:  map[string]struct{}{},
+		lastActivityAt: now,
 	}
 	s.sessions[sess.id] = sess
 	s.sessionsMu.Unlock()
@@ -604,6 +620,7 @@ func (s *Server) handleSessionLine(sess *session, line string) {
 	if err := json.Unmarshal([]byte(line), &parsed); err != nil {
 		return
 	}
+	s.markSessionActivity(sess)
 
 	if idFloat, ok := parsed["id"].(float64); ok {
 		if _, hasResult := parsed["result"]; hasResult || parsed["error"] != nil {
@@ -625,6 +642,7 @@ func (s *Server) handleSessionLine(sess *session, line string) {
 	}
 
 	params, _ := parsed["params"].(map[string]any)
+	s.trackSessionTurnState(sess, method, params)
 	threadID, _ := params["threadId"].(string)
 	if threadID == "" {
 		if inferred := s.inferThreadID(sess); inferred != "" {
@@ -720,6 +738,7 @@ func (s *Server) callSessionRPC(ctx context.Context, sess *session, method strin
 
 	payload := map[string]any{"id": requestID, "method": method, "params": params}
 	encoded, _ := json.Marshal(payload)
+	s.markSessionActivity(sess)
 	if err := s.writeSessionLine(sess, string(encoded)); err != nil {
 		sess.mu.Lock()
 		delete(sess.pending, requestID)
@@ -757,6 +776,10 @@ func (s *Server) writeSessionLine(sess *session, line string) error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.shutdownMu.Do(func() {
+		close(s.reaperStop)
+	})
+
 	done := make(chan struct{})
 	go func() {
 		s.sessionsMu.RLock()
@@ -778,6 +801,88 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func (s *Server) sessionIdleReaper() {
+	for {
+		select {
+		case <-s.reaperStop:
+			return
+		case <-time.After(s.sessionReapInterval):
+		}
+		now := time.Now()
+		s.sessionsMu.RLock()
+		sessions := make([]*session, 0, len(s.sessions))
+		for _, sess := range s.sessions {
+			sessions = append(sessions, sess)
+		}
+		s.sessionsMu.RUnlock()
+		for _, sess := range sessions {
+			if s.shouldReapSession(sess, now) {
+				s.requestSessionStop(sess)
+			}
+		}
+	}
+}
+
+func (s *Server) shouldReapSession(sess *session, now time.Time) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.closed || sess.stopRequested {
+		return false
+	}
+	if len(sess.activeTurnIDs) > 0 {
+		return false
+	}
+	return now.Sub(sess.lastActivityAt) >= s.sessionIdleTTL
+}
+
+func (s *Server) requestSessionStop(sess *session) {
+	sess.mu.Lock()
+	if sess.closed || sess.stopRequested {
+		sess.mu.Unlock()
+		return
+	}
+	sess.stopRequested = true
+	sess.mu.Unlock()
+
+	if sess.cmd.Process != nil {
+		_ = sess.cmd.Process.Signal(os.Interrupt)
+	}
+}
+
+func (s *Server) markSessionActivity(sess *session) {
+	sess.mu.Lock()
+	sess.lastActivityAt = time.Now()
+	sess.mu.Unlock()
+}
+
+func (s *Server) trackSessionTurnState(sess *session, method string, params map[string]any) {
+	turnID := ""
+	if params != nil {
+		if v, ok := params["turnId"].(string); ok {
+			turnID = v
+		}
+		if turnID == "" {
+			if turnObj, ok := params["turn"].(map[string]any); ok {
+				if v, ok := turnObj["id"].(string); ok {
+					turnID = v
+				}
+			}
+		}
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	switch method {
+	case "turn/started":
+		if turnID != "" {
+			sess.activeTurnIDs[turnID] = struct{}{}
+		}
+	case "turn/completed", "turn/aborted", "turn/failed":
+		if turnID != "" {
+			delete(sess.activeTurnIDs, turnID)
+		}
 	}
 }
 

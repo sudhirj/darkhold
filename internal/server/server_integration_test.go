@@ -258,6 +258,18 @@ func parseJSON(t *testing.T, raw string) map[string]any {
 	return payload
 }
 
+func waitForCondition(t *testing.T, timeout, tick time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(tick)
+	}
+	t.Fatal("condition was not met before timeout")
+}
+
 func acceptNextApproval(t *testing.T, baseURL, threadID string, sse *http.Response) {
 	t.Helper()
 	event := waitForSSEEvent(t, sse, func(event sseEvent) bool {
@@ -379,6 +391,42 @@ func TestAllowsTurnStartFromSeparateHTTPCallersOnSameThread(t *testing.T) {
 	}
 	acceptNextApproval(t, s.http.URL, threadID, sse)
 	_ = waitForSSEEvent(t, sse, func(event sseEvent) bool { return parseJSON(t, event.Data)["method"] == "turn/completed" }, 10*time.Second)
+}
+
+func TestReapsIdleSessionAfterTurnCompletion(t *testing.T) {
+	s := startIntegrationServer(t)
+	defer s.close()
+
+	s.app.sessionIdleTTL = 100 * time.Millisecond
+	s.app.sessionReapInterval = 20 * time.Millisecond
+
+	started := postRPC[map[string]any](t, s.http.URL, "thread/start", map[string]any{"cwd": s.baseDir})
+	threadID := started["thread"].(map[string]any)["id"].(string)
+	sse := openSSE(t, s.http.URL, threadID, 0)
+	defer sse.Body.Close()
+
+	_ = postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{
+		"threadId": threadID,
+		"input":    []any{map[string]any{"type": "text", "text": "trigger idle reap"}},
+	})
+	acceptNextApproval(t, s.http.URL, threadID, sse)
+	_ = waitForSSEEvent(t, sse, func(event sseEvent) bool {
+		return parseJSON(t, event.Data)["method"] == "turn/completed"
+	}, 10*time.Second)
+
+	waitForCondition(t, 5*time.Second, 20*time.Millisecond, func() bool {
+		s.app.sessionsMu.RLock()
+		defer s.app.sessionsMu.RUnlock()
+		return len(s.app.sessions) == 0
+	})
+
+	afterReap := postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{
+		"threadId": threadID,
+		"input":    []any{map[string]any{"type": "text", "text": "after reap"}},
+	})
+	if ok, _ := afterReap["ok"].(bool); !ok {
+		t.Fatal("turn/start after reap did not return ok")
+	}
 }
 
 func TestBroadcastsApprovalRequestsToAllSSEClientsAndAcceptsFirstResponse(t *testing.T) {

@@ -66,6 +66,10 @@ Web client:
   - Test evidence (`go test ./...`, web checks as needed).
   - Screenshots/GIFs for UI updates.
 
+## Documentation Maintenance
+- Keep `docs/architecture.md` up to date whenever server runtime behavior, session lifecycle policy, API routing, event streaming semantics, or web-client architecture changes.
+- In PRs and commits that change architecture, update docs in the same change set rather than deferring.
+
 ## Security & Configuration Tips
 - Never commit secrets, tokens, or `.env` values.
 - Restrict filesystem browsing to intended roots (default: user home).

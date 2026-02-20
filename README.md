@@ -2,6 +2,8 @@
 
 Darkhold runs Codex agents on a host machine and exposes them over HTTP with a React UI for folder navigation, thread input, and progress events.
 
+Architecture details: `docs/architecture.md`.
+
 The repository currently contains:
 - Go server in `cmd/` + `internal/`
 - Web client in `clients/web` (Vite build embedded by Go server)
