@@ -21,18 +21,10 @@ function summarizeThreadReadItem(item: any): { type: string; message: string } |
   if (item.type === 'agentMessage' && typeof item.text === 'string') {
     return { type: 'assistant.output', message: item.text };
   }
-  if (item.type === 'commandExecution' && typeof item.command === 'string') {
-    const state = typeof item.status === 'string' ? item.status : 'updated';
-    return { type: `command.${state}`, message: item.command };
-  }
   if (item.type === 'fileChange' && Array.isArray(item.changes)) {
     return { type: 'file.change', message: `${item.changes.length} file(s) changed` };
   }
-  if (item.type === 'mcpToolCall' && typeof item.tool === 'string') {
-    const server = typeof item.server === 'string' ? item.server : 'mcp';
-    return { type: 'mcp.tool', message: `${server}.${item.tool}` };
-  }
-  return { type: `item.${item.type}`, message: JSON.stringify(item) };
+  return null;
 }
 
 export type ThreadEventLogStore = {
@@ -124,6 +116,14 @@ export function createThreadEventLogStore(rootDir: string): ThreadEventLogStore 
             params: { threadId, source: 'thread/read', turnNumber: turnIndex + 1 },
           }),
         );
+        if (turn?.status === 'failed' && turn?.error?.message) {
+          lines.push(
+            JSON.stringify({
+              method: 'darkhold/thread-event',
+              params: { threadId, type: 'turn.error', message: turn.error.message, source: 'thread/read' },
+            }),
+          );
+        }
       }
       const payload = lines.length > 0 ? `${lines.join('\n')}\n` : '';
       await withThreadFileLock(threadId, async () => {
@@ -135,4 +135,3 @@ export function createThreadEventLogStore(rootDir: string): ThreadEventLogStore 
     },
   };
 }
-

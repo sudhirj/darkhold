@@ -57,18 +57,42 @@ describe('thread event log store', () => {
                 type: 'agentMessage',
                 text: 'world',
               },
+              {
+                type: 'fileChange',
+                changes: [{ path: 'a.txt', kind: 'modified' }],
+              },
+              {
+                type: 'commandExecution',
+                command: 'echo hi',
+                status: 'completed',
+              },
+              {
+                type: 'mcpToolCall',
+                server: 'demo',
+                tool: 'x',
+              },
+              {
+                type: 'someFutureType',
+              },
             ],
+            status: 'failed',
+            error: { message: 'boom' },
           },
         ],
       },
     });
 
     const events = await store.read('thread-3');
-    expect(events.length).toBe(3);
+    expect(events.length).toBe(5);
     expect(events[0]).toContain('"method":"darkhold/thread-event"');
     expect(events[1]).toContain('"assistant.output"');
-    expect(events[2]).toContain('"method":"turn/completed"');
+    expect(events[2]).toContain('"file.change"');
+    expect(events[3]).toContain('"method":"turn/completed"');
+    expect(events[4]).toContain('"turn.error"');
     expect(events.join('\n')).not.toContain('"stale"');
+    expect(events.join('\n')).not.toContain('"command."');
+    expect(events.join('\n')).not.toContain('"mcp.tool"');
+    expect(events.join('\n')).not.toContain('"item.someFutureType"');
   });
 
   it('cleans up the event log root', async () => {
@@ -80,4 +104,3 @@ describe('thread event log store', () => {
     expect(events).toEqual([]);
   });
 });
-
