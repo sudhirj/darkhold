@@ -2,32 +2,41 @@
 
 ## Project Structure & Module Organization
 This project hosts Codex agents on a local machine and exposes them over HTTP. Use:
-- `src/server/` for Bun HTTP server, routing, and bind/port startup.
-- `src/agent/` for agent lifecycle logic (spawn, thread state, input, progress).
-- `src/fs/` for safe home-directory navigation utilities.
-- `src/web/` for the React UI (folder picker, thread view, input box, progress UI).
-- `tests/` mirroring `src/` (`tests/server/`, `tests/agent/`, etc.).
+- `cmd/darkhold/` for Go application startup and process wiring.
+- `internal/server/` for HTTP routing, RPC handling, SSE streaming, and embedded web serving.
+- `internal/events/` for append-only thread event storage and rehydration helpers.
+- `internal/fs/` for safe home-directory navigation utilities.
+- `internal/config/` for bind/port/CIDR parsing and validation.
+- `clients/web/` for the React + Vite web client.
 - `docs/` for API contracts and architecture decisions.
 
 ## Build, Test, and Development Commands
-Standardize on Bun scripts in `package.json`:
-- `bun install` installs dependencies.
-- `bun run dev` starts server + web UI in development.
-- `bun run start -- --bind 127.0.0.1 --port 3275` runs the distributable locally on a chosen interface/port.
-- `bun run test` runs automated tests.
-- `bun run lint` runs TypeScript + lint checks.
-- `bun run build` creates the production bundle/binary.
+Go server commands:
+- `go test ./...` runs Go unit/integration tests.
+- `./dev-go-server` builds `clients/web`, builds Go binary, and runs server.
+- `./dev-hot` rebuilds embedded web bundle + Go binary on change and restarts server.
+- `./dev-hmr` runs Go hot reload and Vite HMR in parallel.
+
+Web client commands (scoped to `clients/web`):
+- `npm --prefix clients/web install` installs web dependencies.
+- `npm --prefix clients/web run dev` starts Vite HMR dev server.
+- `npm --prefix clients/web run build` builds static assets into `internal/server/webdist`.
+- `npm --prefix clients/web run typecheck` runs web TypeScript checks.
 
 ## Agent Runtime Expectations
-- Use the official Codex SDK (`@openai/codex-sdk`) for thread/session management.
+- Server talks to `codex app-server` over stdio per session.
 - Assume local login/auth with Codex has already been completed on the host machine.
 - Server endpoints are intentionally unauthenticated for now; deployment assumption is localhost or trusted private network access (for example, Tailscale).
 
 ## Coding Style & Naming Conventions
-- TypeScript everywhere (`.ts`/`.tsx`), strict mode enabled.
+Go server:
+- Keep Go code idiomatic and `gofmt`-formatted.
+- Keep transport DTOs explicit; avoid untyped payload plumbing where possible.
+
+Web client:
+- TypeScript (`.ts`/`.tsx`) with strict mode.
 - 2-space indentation, semicolons on, single quotes.
-- `PascalCase` for React components and types, `camelCase` for functions/variables, `kebab-case` for file names.
-- Keep transport DTOs in explicit types; do not pass untyped JSON through agent boundaries.
+- `PascalCase` for React components/types, `camelCase` for functions/variables, `kebab-case` for file names.
 
 ## UI Typography
 - Default UI font family: `IBM Plex Sans` (or `IBM Plex Serif` where intentionally used).
@@ -42,18 +51,19 @@ Standardize on Bun scripts in `package.json`:
 - Before implementing or modifying any Headless UI or Bootstrap component, read the official documentation page for that exact component/API and follow its recommended structure and behavior.
 
 ## Testing Guidelines
-- Use Bun test runner for unit/integration tests.
-- Cover: bind/port parsing, folder traversal safety, agent spawn/stop, thread input handling, and progress event streaming.
+- Use `go test ./...` for backend feature coverage.
+- Cover: bind/port parsing, CIDR filtering, folder traversal safety, session spawn/stop, thread input handling, interaction respond flow, and SSE event streaming/rehydration.
+- Web client checks should include `npm --prefix clients/web run typecheck`.
 - Test names should describe behavior (example: `starts agent when folder is selected`).
 
 ## Commit & Pull Request Guidelines
 - Use imperative commits with scope: `server: add bind option`, `web: render thread progress`.
-- Keep each commit focused on one concern (server, agent, or UI).
+- Keep each commit focused on one concern (server or web client).
 - Do not commit or push unless the user explicitly asks for it in the current conversation.
 - PRs should include:
   - Goal and user-visible behavior.
   - API or protocol changes.
-  - Test evidence (`bun run test`, manual steps).
+  - Test evidence (`go test ./...`, web checks as needed).
   - Screenshots/GIFs for UI updates.
 
 ## Security & Configuration Tips

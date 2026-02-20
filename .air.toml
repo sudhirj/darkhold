@@ -8,7 +8,7 @@ tmp_dir = ".tmp/air"
   stop_on_error = true
   include_dir = ["cmd", "internal", "clients/web"]
   include_ext = ["go", "ts", "tsx", "css", "html", "json", "md"]
-  include_file = ["go.mod", "go.sum", "package.json", "clients/web/package.json", "clients/web/package-lock.json"]
+  include_file = ["go.mod", "go.sum", "clients/web/package.json", "clients/web/package-lock.json"]
   exclude_dir = [".git", ".tmp", "node_modules", "dist", "internal/server/webdist"]
 
 [log]

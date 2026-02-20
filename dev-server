@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Backward-compatible entrypoint: use Go API + Vite HMR stack.
-exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dev-hmr" "$@"

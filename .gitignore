@@ -1,4 +1,6 @@
 node_modules/
+clients/web/node_modules/
+clients/web/package-lock.json
 dist/
 .DS_Store
 .tmp/

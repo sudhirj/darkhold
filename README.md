@@ -3,7 +3,6 @@
 Darkhold runs Codex agents on a host machine and exposes them over HTTP with a React UI for folder navigation, thread input, and progress events.
 
 The repository currently contains:
-- Legacy TypeScript server in `src/`
 - Go server in `cmd/` + `internal/`
 - Web client in `clients/web` (Vite build embedded by Go server)
 
@@ -17,20 +16,6 @@ The repository currently contains:
 
 ```bash
 npm --prefix clients/web install
-```
-
-## Install From GitHub Releases
-
-Install the latest release binary directly:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/sudhirj/darkhold/main/install.sh | sh
-```
-
-Install a specific release tag:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/sudhirj/darkhold/main/install.sh | sh -s -- --version build-<git-sha>
 ```
 
 ## Run in Development
