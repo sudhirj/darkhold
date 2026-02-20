@@ -1,6 +1,10 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Dialog, DialogBackdrop, DialogPanel, DialogTitle, Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
+import 'bootstrap/dist/css/bootstrap.min.css';
+import 'bootstrap-icons/font/bootstrap-icons.css';
+import '@ibm/plex/css/ibm-plex.css';
+import './styles.css';
 import { jsonFetch } from './api';
 import { FolderBrowserDialog } from './components/folder-browser-dialog';
 import { AgentThreadPanel } from './components/agent-thread-panel';

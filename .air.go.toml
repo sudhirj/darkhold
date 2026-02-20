@@ -1,0 +1,18 @@
+root = "."
+tmp_dir = ".tmp/air-go"
+
+[build]
+  cmd = "mkdir -p .tmp/go-cache .tmp/go-tmp .tmp/bin && GOCACHE=$(pwd)/.tmp/go-cache GOTMPDIR=$(pwd)/.tmp/go-tmp go build -o ./.tmp/bin/darkhold-go ./cmd/darkhold"
+  bin = "./.tmp/bin/darkhold-go --bind 127.0.0.1 --port 3275"
+  delay = 250
+  stop_on_error = true
+  include_dir = ["cmd", "internal"]
+  include_ext = ["go"]
+  include_file = ["go.mod", "go.sum"]
+  exclude_dir = [".git", ".tmp", "dist", "internal/server/webdist"]
+
+[log]
+  time = true
+
+[misc]
+  clean_on_exit = false

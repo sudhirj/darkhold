@@ -5,12 +5,11 @@
     "moduleResolution": "bundler",
     "strict": true,
     "jsx": "react-jsx",
-    "types": [],
+    "types": ["vite/client"],
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
-    "noEmit": true,
-    "baseUrl": "."
+    "noEmit": true
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "clients/web/src/**/*.ts", "clients/web/src/**/*.tsx", "clients/web/vite.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts"]
 }

@@ -1,0 +1,24 @@
+root = "."
+tmp_dir = ".tmp/air"
+
+[build]
+  cmd = "mkdir -p .tmp/go-cache .tmp/go-tmp .tmp/bin && npm --prefix clients/web run build && GOCACHE=$(pwd)/.tmp/go-cache GOTMPDIR=$(pwd)/.tmp/go-tmp go build -o ./.tmp/bin/darkhold-go ./cmd/darkhold"
+  bin = "./.tmp/bin/darkhold-go --bind 127.0.0.1 --port 3275"
+  delay = 250
+  stop_on_error = true
+  include_dir = ["cmd", "internal", "clients/web"]
+  include_ext = ["go", "ts", "tsx", "css", "html", "json", "md"]
+  include_file = ["go.mod", "go.sum", "package.json", "clients/web/package.json", "clients/web/package-lock.json"]
+  exclude_dir = [".git", ".tmp", "node_modules", "dist", "internal/server/webdist"]
+
+[log]
+  time = true
+
+[color]
+  main = "cyan"
+  watcher = "yellow"
+  build = "green"
+  runner = "magenta"
+
+[misc]
+  clean_on_exit = false

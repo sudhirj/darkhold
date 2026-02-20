@@ -2,15 +2,21 @@
 
 Darkhold runs Codex agents on a host machine and exposes them over HTTP with a React UI for folder navigation, thread input, and progress events.
 
+The repository currently contains:
+- Legacy TypeScript server in `src/`
+- Go server in `cmd/` + `internal/`
+- Web client in `clients/web` (Vite build embedded by Go server)
+
 ## Prerequisites
 
-- Bun 1.2+
+- Go 1.22+
+- Node.js 20+ (for `clients/web` Vite build/dev)
 - Codex CLI login already completed on the host machine
 
 ## Install
 
 ```bash
-bun install
+npm --prefix clients/web install
 ```
 
 ## Install From GitHub Releases
@@ -29,19 +35,14 @@ curl -fsSL https://raw.githubusercontent.com/sudhirj/darkhold/main/install.sh | 
 
 ## Run in Development
 
-Start on port `3275` (D=3, A=2, R=7, K=5):
+Run Go API hot reload + Vite HMR together:
 
 ```bash
-bun run dev
+go install github.com/air-verse/air@latest
+./dev-hmr
 ```
 
-Run on a custom interface/port:
-
-```bash
-bun run start -- --bind 127.0.0.1 --port 3275
-```
-
-Open: `http://127.0.0.1:3275`
+Open: `http://127.0.0.1:5173`
 
 ## Network Flags
 
@@ -51,43 +52,45 @@ Darkhold server startup accepts:
   Example: `127.0.0.1` (localhost only), `0.0.0.0` (all IPv4 interfaces).
 - `--port`: TCP port to listen on.
   Default is `3275`.
-- `--rpc-port`: TCP port for the Codex app-server WebSocket endpoint.
-  Default is `3276`.
 - `--allow-cidr`: Allowlist of remote IPv4 CIDRs.
   You can pass this flag multiple times. Loopback (`127.0.0.1` / `::1`) is always allowed.
 
 Default behavior:
 
-- `bun run start` defaults to `--bind 127.0.0.1 --port 3275` with no CIDR restriction flag.
-- `bun run dev` defaults to `--bind 0.0.0.0 --port 3275 --allow-cidr 100.64.0.0/10`.
-- `100.64.0.0/10` is the default Tailscale CGNAT range used by the dev script.
+- Go server binds to `127.0.0.1:3275` in provided dev scripts.
+- Vite dev server binds to `127.0.0.1:5173` and proxies `/api` to `127.0.0.1:3275`.
 
 ## Build
 
-Build server + frontend assets:
+Build frontend assets for Go embed:
 
 ```bash
-bun run build
+npm --prefix clients/web run build
 ```
 
-Compile a single distributable binary:
+Run the Go server (builds web client first, then builds and runs Go binary):
 
 ```bash
-bun run bundle
+./dev-go-server
 ```
 
-Output binary path:
+Run single-process Go hot reload with embedded web rebuild on each change:
 
-- `dist/darkhold`
+```bash
+go install github.com/air-verse/air@latest
+./dev-hot
+```
 
 ## API Notes
 
 - Server has no built-in auth (intended for localhost or trusted private network access such as Tailscale).
 - Folder browsing is restricted to the user home directory.
-- Codex session/turn lifecycle is handled over JSON-RPC WebSockets via `codex app-server`, proxied through the Darkhold server.
+- Codex session/turn lifecycle is handled over JSON-RPC using HTTP endpoints on Darkhold; Darkhold talks to `codex app-server` over stdio.
 
 ## Useful Endpoints
 
 - `GET /api/health`
 - `GET /api/fs/list?path=/optional/path`
-- `GET /api/rpc/ws` (WebSocket upgrade endpoint for app-server RPC proxy)
+- `POST /api/rpc`
+- `GET /api/thread/events?threadId=<thread-id>`
+- `GET /api/thread/events/stream?threadId=<thread-id>` (SSE)

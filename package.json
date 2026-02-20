@@ -1,29 +1,12 @@
 {
-  "name": "darkhold",
-  "version": "0.1.0",
+  "name": "darkhold-root",
   "private": true,
-  "type": "module",
+  "version": "0.1.0",
   "scripts": {
-    "dev": "bun run src/server/index.ts -- --bind 0.0.0.0 --port 3275 --allow-cidr 100.64.0.0/10",
-    "dev:hot": "DARKHOLD_DEV=1 bun --hot --no-clear-screen src/server/index.ts -- --bind 0.0.0.0 --port 3275 --allow-cidr 100.64.0.0/10",
-    "start": "bun run src/server/index.ts",
-    "build:web": "bun build src/web/main.tsx --outfile dist/public/app.js --target browser --format esm --minify",
-    "build:server": "bun build src/server/index.ts --outfile dist/server.js --target bun --format esm --minify",
-    "build": "mkdir -p dist/public && bun run build:web && cp src/web/index.html dist/public/index.html && cp src/web/styles.css dist/public/styles.css && bun run build:server",
-    "bundle": "mkdir -p dist && bun build src/server/index.ts --compile --outfile dist/darkhold",
-    "test": "bun test",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@headlessui/react": "^2.2.0",
-    "@ibm/plex": "^1.0.2",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0"
-  },
-  "devDependencies": {
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "bun-types": "^1.2.0",
-    "typescript": "^5.7.0"
+    "dev:go:hot": "./dev-hot",
+    "dev:hmr": "./dev-hmr",
+    "build:web": "npm --prefix clients/web run build",
+    "dev:web": "npm --prefix clients/web run dev",
+    "typecheck:web": "npm --prefix clients/web run typecheck"
   }
 }
