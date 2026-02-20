@@ -18,14 +18,11 @@
     "@headlessui/react": "^2.2.0",
     "@ibm/plex": "^1.0.2",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "reconnecting-websocket": "^4.4.0",
-    "ws": "^8.19.0"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@types/ws": "^8.18.1",
     "bun-types": "^1.2.0",
     "typescript": "^5.7.0"
   }

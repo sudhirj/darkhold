@@ -1,7 +1,6 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Dialog, DialogBackdrop, DialogPanel, DialogTitle, Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
-import ReconnectingWebSocket from 'reconnecting-websocket';
 import { jsonFetch } from './api';
 import { FolderBrowserDialog } from './components/folder-browser-dialog';
 import { AgentThreadPanel } from './components/agent-thread-panel';
@@ -13,14 +12,6 @@ type JsonRpcRequest = {
   method: string;
   params?: unknown;
 };
-
-type JsonRpcResponse = {
-  id: number;
-  result?: unknown;
-  error?: { code?: number; message?: string };
-};
-
-type JsonRpcIncoming = JsonRpcRequest | JsonRpcResponse | { method: string; params?: unknown };
 
 type ThreadListEntry = {
   id: string;
@@ -267,190 +258,12 @@ function buildSessionFromThreadRead(response: ThreadReadResponse): Session {
   };
 }
 
-class RpcClient {
-  private ws: ReconnectingWebSocket | null = null;
-
-  private nextId = 1;
-
-  private pending = new Map<
-    number,
-    { resolve: (value: any) => void; reject: (error: Error) => void; timeoutId: number }
-  >();
-
-  private requestHandler: ((request: JsonRpcRequest) => Promise<unknown>) | null = null;
-
-  private notificationHandler: ((method: string, params: unknown) => void) | null = null;
-
-  private closeHandler: (() => void) | null = null;
-
-  private openHandler: (() => void) | null = null;
-
-  private suppressCloseHandler = false;
-
-  setRequestHandler(handler: (request: JsonRpcRequest) => Promise<unknown>) {
-    this.requestHandler = handler;
-  }
-
-  setNotificationHandler(handler: (method: string, params: unknown) => void) {
-    this.notificationHandler = handler;
-  }
-
-  setCloseHandler(handler: () => void) {
-    this.closeHandler = handler;
-  }
-
-  setOpenHandler(handler: () => void) {
-    this.openHandler = handler;
-  }
-
-  async connect(url: string): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      const ws = new ReconnectingWebSocket(url, [], {
-        WebSocket,
-        minReconnectionDelay: 150,
-        maxReconnectionDelay: 1_500,
-        reconnectionDelayGrowFactor: 1.25,
-        minUptime: 500,
-        connectionTimeout: 1_500,
-        maxRetries: Infinity,
-      });
-      let resolved = false;
-      ws.onopen = () => {
-        this.ws = ws;
-        if (!resolved) {
-          resolved = true;
-          resolve();
-        }
-        this.openHandler?.();
-      };
-      ws.onerror = () => {
-        if (!resolved) {
-          reject(new Error(`Failed to connect to Codex app-server at ${url}`));
-        }
-      };
-      ws.onmessage = (event) => {
-        void this.onMessage(event.data);
-      };
-      ws.onclose = () => {
-        for (const [, pending] of this.pending) {
-          window.clearTimeout(pending.timeoutId);
-          pending.reject(new Error('RPC connection closed.'));
-        }
-        this.pending.clear();
-        this.ws = null;
-        if (this.suppressCloseHandler) {
-          this.suppressCloseHandler = false;
-          return;
-        }
-        this.closeHandler?.();
-      };
-    });
-  }
-
-  close(options?: { suppressHandler?: boolean }) {
-    this.suppressCloseHandler = options?.suppressHandler ?? false;
-    this.ws?.close();
-    this.ws = null;
-  }
-
-  async request<T = unknown>(method: string, params?: unknown): Promise<T> {
-    const id = this.nextId;
-    this.nextId += 1;
-
-    const message: JsonRpcRequest = {
-      id,
-      method,
-      params,
-    };
-
-    return await new Promise<T>((resolve, reject) => {
-      const timeoutId = window.setTimeout(() => {
-        const pending = this.pending.get(id);
-        if (!pending) {
-          return;
-        }
-        this.pending.delete(id);
-        pending.reject(new Error(`RPC request timed out: ${method}`));
-      }, 15_000);
-      this.pending.set(id, { resolve, reject, timeoutId });
-      this.send(message);
-    });
-  }
-
-  private async onMessage(raw: unknown) {
-    let text: string;
-    if (typeof raw === 'string') {
-      text = raw;
-    } else if (typeof Blob !== 'undefined' && raw instanceof Blob) {
-      text = await raw.text();
-    } else {
-      text = String(raw);
-    }
-
-    let parsed: JsonRpcIncoming;
-    try {
-      parsed = JSON.parse(text) as JsonRpcIncoming;
-    } catch {
-      return;
-    }
-
-    if (typeof (parsed as JsonRpcResponse).id === 'number' && 'result' in parsed) {
-      const response = parsed as JsonRpcResponse;
-      const pending = this.pending.get(response.id);
-      if (!pending) {
-        return;
-      }
-      this.pending.delete(response.id);
-      window.clearTimeout(pending.timeoutId);
-      pending.resolve(response.result);
-      return;
-    }
-
-    if (typeof (parsed as JsonRpcResponse).id === 'number' && 'error' in parsed) {
-      const response = parsed as JsonRpcResponse;
-      const pending = this.pending.get(response.id);
-      if (!pending) {
-        return;
-      }
-      this.pending.delete(response.id);
-      window.clearTimeout(pending.timeoutId);
-      pending.reject(new Error(response.error?.message ?? 'RPC error'));
-      return;
-    }
-
-    if (typeof (parsed as JsonRpcRequest).id === 'number' && typeof (parsed as JsonRpcRequest).method === 'string') {
-      const request = parsed as JsonRpcRequest;
-      if (!this.requestHandler) {
-        this.send({ id: request.id, error: { code: -32601, message: 'No request handler configured.' } });
-        return;
-      }
-      try {
-        const result = await this.requestHandler(request);
-        this.send({ id: request.id, result });
-      } catch (error: unknown) {
-        this.send({
-          id: request.id,
-          error: {
-            code: -32000,
-            message: error instanceof Error ? error.message : String(error),
-          },
-        });
-      }
-      return;
-    }
-
-    if (typeof (parsed as { method?: unknown }).method === 'string') {
-      const notification = parsed as { method: string; params?: unknown };
-      this.notificationHandler?.(notification.method, notification.params);
-    }
-  }
-
-  private send(message: unknown) {
-    if (!this.ws) {
-      throw new Error('RPC connection is not open.');
-    }
-    this.ws.send(JSON.stringify(message));
-  }
+async function rpcPost<T = unknown>(method: string, params?: unknown): Promise<T> {
+  return await jsonFetch<T>('/api/rpc', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ method, params }),
+  });
 }
 
 function App() {
@@ -474,7 +287,8 @@ function App() {
   const folderInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const suppressNextAutoFocusRef = useRef(false);
   const [pendingFocusPath, setPendingFocusPath] = useState<string | null>(null);
-  const rpcRef = useRef<RpcClient | null>(null);
+  const threadEventsSourceRef = useRef<EventSource | null>(null);
+  const threadEventsSourceThreadIdRef = useRef<string | null>(null);
   const activeThreadIdRef = useRef<string | null>(null);
   const queuedUiRequestsRef = useRef<PendingUiRequest[]>([]);
   const shouldStickToBottomRef = useRef(true);
@@ -504,17 +318,23 @@ function App() {
 
   useEffect(() => {
     void initializeFolderBrowser();
-    void connectRpc();
+    void refreshSessions();
+    const activeThreadId = readSessionIdFromUrl();
+    if (activeThreadId) {
+      void resumeSession(activeThreadId, { updateUrl: true });
+    }
 
     const onOffline = () => {
       setError('Browser is offline. Waiting for network...');
-      rpcRef.current?.close({ suppressHandler: true });
-      rpcRef.current = null;
     };
 
     const onOnline = () => {
       setError('Network restored. Reconnecting...');
-      void connectRpc();
+      void refreshSessions();
+      const activeThreadId = readSessionIdFromUrl();
+      if (activeThreadId) {
+        void resumeSession(activeThreadId, { updateUrl: true });
+      }
     };
 
     window.addEventListener('offline', onOffline);
@@ -523,7 +343,9 @@ function App() {
     return () => {
       window.removeEventListener('offline', onOffline);
       window.removeEventListener('online', onOnline);
-      rpcRef.current?.close({ suppressHandler: true });
+      threadEventsSourceRef.current?.close();
+      threadEventsSourceRef.current = null;
+      threadEventsSourceThreadIdRef.current = null;
     };
   }, []);
 
@@ -596,6 +418,49 @@ function App() {
 
   useEffect(() => {
     activeThreadIdRef.current = session?.threadId ?? null;
+  }, [session?.threadId]);
+
+  useEffect(() => {
+    const threadId = session?.threadId ?? null;
+    if (!threadId) {
+      threadEventsSourceRef.current?.close();
+      threadEventsSourceRef.current = null;
+      threadEventsSourceThreadIdRef.current = null;
+      return;
+    }
+    if (threadEventsSourceRef.current && threadEventsSourceThreadIdRef.current === threadId) {
+      return;
+    }
+
+    threadEventsSourceRef.current?.close();
+    const source = new EventSource(`/api/thread/events/stream?threadId=${encodeURIComponent(threadId)}`);
+    source.onmessage = (event) => {
+      let parsed: { method?: string; params?: unknown };
+      try {
+        parsed = JSON.parse(event.data) as { method?: string; params?: unknown };
+      } catch {
+        return;
+      }
+      if (typeof parsed.method !== 'string') {
+        return;
+      }
+      handleNotification(parsed.method, parsed.params);
+    };
+    source.onerror = () => {
+      // Browser will reconnect automatically and resume from Last-Event-ID.
+    };
+    threadEventsSourceRef.current = source;
+    threadEventsSourceThreadIdRef.current = threadId;
+
+    return () => {
+      source.close();
+      if (threadEventsSourceRef.current === source) {
+        threadEventsSourceRef.current = null;
+      }
+      if (threadEventsSourceThreadIdRef.current === threadId) {
+        threadEventsSourceThreadIdRef.current = null;
+      }
+    };
   }, [session?.threadId]);
 
   useEffect(() => {
@@ -787,8 +652,38 @@ function App() {
     throw new Error(`Unsupported server request: ${request.method}`);
   }
 
+  async function handleThreadInteractionRequest(payload: any): Promise<void> {
+    const threadId = typeof payload?.threadId === 'string' ? payload.threadId : '';
+    const requestId = typeof payload?.requestId === 'string' ? payload.requestId : '';
+    const method = typeof payload?.method === 'string' ? payload.method : '';
+    if (!threadId || !requestId || !method) {
+      return;
+    }
+
+    try {
+      const result = await handleServerRequest({ id: 0, method, params: payload?.params });
+      await jsonFetch<{ ok: boolean }>('/api/thread/interaction/respond', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ threadId, requestId, result }),
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      await jsonFetch<{ ok: boolean }>('/api/thread/interaction/respond', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ threadId, requestId, error: { message } }),
+      }).catch(() => {});
+    }
+  }
+
   function handleNotification(method: string, params: unknown) {
     const payload = (params ?? {}) as any;
+
+    if (method === 'darkhold/interaction/request') {
+      void handleThreadInteractionRequest(payload);
+      return;
+    }
 
     if (method === 'turn/started' && typeof payload.threadId === 'string') {
       const turnId = extractTurnId(payload) ?? `live-turn:${payload.threadId}:${Date.now()}`;
@@ -843,81 +738,6 @@ function App() {
     }
   }
 
-  async function initializeRpcSession(rpc: RpcClient) {
-    await rpc.request('initialize', {
-      clientInfo: {
-        name: 'darkhold-web',
-        title: 'Darkhold Web',
-        version: '0.1.0',
-      },
-      capabilities: {
-        experimentalApi: true,
-      },
-    });
-
-    await refreshSessions(rpc);
-
-    const activeThreadId = activeThreadIdRef.current ?? readSessionIdFromUrl();
-    if (activeThreadId) {
-      try {
-        const resumed = await rpc.request<ThreadReadResponse>('thread/resume', {
-          threadId: activeThreadId,
-        });
-        const loaded = buildSessionFromThreadRead(resumed);
-        setSession(loaded);
-        setThreadCurrentTurn(activeThreadId, loaded.currentTurnId);
-        writeSessionIdToUrl(activeThreadId);
-      } catch {
-        const response = await rpc.request<ThreadReadResponse>('thread/read', {
-          threadId: activeThreadId,
-          includeTurns: true,
-        });
-        const loaded = buildSessionFromThreadRead(response);
-        setSession(loaded);
-        setThreadCurrentTurn(activeThreadId, loaded.currentTurnId);
-        writeSessionIdToUrl(activeThreadId);
-      }
-    }
-  }
-
-  async function connectRpc() {
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      setError('Browser is offline. Waiting for network...');
-      return;
-    }
-
-    try {
-      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      const reconnectThreadId = activeThreadIdRef.current ?? readSessionIdFromUrl();
-      const wsUrl =
-        reconnectThreadId && reconnectThreadId.trim().length > 0
-          ? `${protocol}://${window.location.host}/api/rpc/ws?threadId=${encodeURIComponent(reconnectThreadId)}`
-          : `${protocol}://${window.location.host}/api/rpc/ws`;
-
-      rpcRef.current?.close({ suppressHandler: true });
-      const rpc = new RpcClient();
-      rpc.setRequestHandler(handleServerRequest);
-      rpc.setNotificationHandler(handleNotification);
-      rpc.setCloseHandler(() => {
-        setError('RPC connection lost. Reconnecting...');
-      });
-      rpc.setOpenHandler(() => {
-        void (async () => {
-          try {
-            await initializeRpcSession(rpc);
-            setError(null);
-          } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : String(err));
-          }
-        })();
-      });
-      await rpc.connect(wsUrl);
-      rpcRef.current = rpc;
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
   async function loadFolder(path?: string): Promise<FolderListing> {
     const next = await jsonFetch<FolderListing>(`/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ''}`);
     setFolderCache((prev) => ({ ...prev, [next.path]: next }));
@@ -952,14 +772,9 @@ function App() {
     }
   }
 
-  async function refreshSessions(client?: RpcClient) {
-    const rpc = client ?? rpcRef.current;
-    if (!rpc) {
-      return;
-    }
-
+  async function refreshSessions() {
     try {
-      const result = await rpc.request<{ data: ThreadListEntry[] }>('thread/list', {
+      const result = await rpcPost<{ data: ThreadListEntry[] }>('thread/list', {
         limit: 50,
         archived: false,
       });
@@ -983,16 +798,10 @@ function App() {
   }
 
   async function startSessionForPath(targetPath: string) {
-    const rpc = rpcRef.current;
-    if (!rpc) {
-      setError('RPC connection is not ready yet. Please wait for reconnect and try again.');
-      return;
-    }
-
     try {
       setError(null);
       const listing = await loadFolder(targetPath);
-      const response = await rpc.request<{ thread: { id: string; cwd: string; updatedAt: number } }>('thread/start', {
+      const response = await rpcPost<{ thread: { id: string; cwd: string; updatedAt: number } }>('thread/start', {
         cwd: listing.path,
         approvalPolicy: 'on-request',
         sandbox: 'workspace-write',
@@ -1025,20 +834,15 @@ function App() {
   }
 
   async function resumeSession(threadId: string, options?: { updateUrl?: boolean }) {
-    const rpc = rpcRef.current;
-    if (!rpc) {
-      return;
-    }
-
     try {
       setError(null);
       let response: ThreadReadResponse;
       try {
-        response = await rpc.request<ThreadReadResponse>('thread/resume', {
+        response = await rpcPost<ThreadReadResponse>('thread/resume', {
           threadId,
         });
       } catch {
-        response = await rpc.request<ThreadReadResponse>('thread/read', {
+        response = await rpcPost<ThreadReadResponse>('thread/read', {
           threadId,
           includeTurns: true,
         });
@@ -1060,8 +864,7 @@ function App() {
 
   async function submitPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const rpc = rpcRef.current;
-    if (!rpc || !session || !prompt.trim()) {
+    if (!session || !prompt.trim()) {
       return;
     }
 
@@ -1084,13 +887,13 @@ function App() {
       };
 
       try {
-        await rpc.request('turn/start', turnParams);
+        await rpcPost('turn/start', turnParams);
       } catch (error: unknown) {
         if (!isThreadNotFoundError(error)) {
           throw error;
         }
-        await rpc.request('thread/resume', { threadId: session.threadId });
-        await rpc.request('turn/start', turnParams);
+        await rpcPost('thread/resume', { threadId: session.threadId });
+        await rpcPost('turn/start', turnParams);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);

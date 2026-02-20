@@ -12,33 +12,21 @@ type ServerConfig = {
   basePath?: string;
 };
 
-type WsProxyData = {
-  connectionId: number;
-  clientMessageCount: number;
-  appServerMessageCount: number;
-  appServerId: number | null;
-  desiredThreadId: string | null;
-};
-
 type AppServerSession = {
   id: number;
   child: ChildProcess;
   stdoutBuffer: string;
-  turnInProgress: boolean;
-  shutdownAfterTurnComplete: boolean;
-  attachedConnectionIds: Set<number>;
+  upstreamInitialized: boolean;
   knownThreadIds: Set<string>;
   nextUpstreamRequestId: number;
-  pendingClientRequests: Map<number, { connectionId: number; clientRequestId: number; method: string }>;
-  pendingServerRequestTargets: Map<number, number>;
-  lastRequesterConnectionId: number | null;
-};
-
-type ServerWebSocketLike = {
-  readyState: number;
-  data: WsProxyData;
-  send: (data: string) => void;
-  close: (code?: number, reason?: string) => void;
+  pendingClientRequests: Map<
+    number,
+    {
+      method: string;
+      resolveHttp?: (payload: any) => void;
+      rejectHttp?: (error: Error) => void;
+    }
+  >;
 };
 
 function normalizeRpcPayload(payload: string | ArrayBuffer | Uint8Array): string {
@@ -299,22 +287,18 @@ const threadEventLog = createThreadEventLogStore(eventsTmpRoot);
 const config = parseConfig(process.argv.slice(2));
 await setBrowserRoot(config.basePath);
 await mkdir(eventsTmpRoot, { recursive: true });
-let wsProxyConnectionCounter = 0;
 let appServerSessionCounter = 0;
-const activeWsConnections = new Map<number, ServerWebSocketLike>();
 const activeAppServerChildren = new Set<ChildProcess>();
 const appServerSessions = new Map<number, AppServerSession>();
-const reusableAppServerSessionIds: number[] = [];
 const threadToSessionId = new Map<string, number>();
-const threadToConnectionIds = new Map<string, Set<number>>();
-const connectionToThreadIds = new Map<number, Set<string>>();
-
-function sessionForConnection(ws: ServerWebSocketLike): AppServerSession | null {
-  if (ws.data.appServerId === null) {
-    return null;
-  }
-  return appServerSessions.get(ws.data.appServerId) ?? null;
-}
+const threadSseSubscribers = new Map<string, Map<number, (frame: string) => void>>();
+const threadPublishChains = new Map<string, Promise<void>>();
+const threadNextEventId = new Map<string, number>();
+const pendingThreadInteractionRequests = new Map<
+  string,
+  Map<string, { sessionId: number; upstreamRequestId: number; method: string; params: any }>
+>();
+let threadSseSubscriberCounter = 0;
 
 async function appendThreadEvent(threadId: string, payload: string) {
   await threadEventLog.append(threadId, payload);
@@ -326,6 +310,8 @@ async function readThreadEvents(threadId: string): Promise<string[]> {
 
 async function rehydrateThreadEventsFromRead(threadId: string, readResult: any): Promise<void> {
   await threadEventLog.rehydrateFromThreadRead(threadId, readResult);
+  const events = await readThreadEvents(threadId);
+  threadNextEventId.set(threadId, events.length + 1);
 }
 
 function bindThreadToSession(threadId: string, session: AppServerSession) {
@@ -333,84 +319,96 @@ function bindThreadToSession(threadId: string, session: AppServerSession) {
   session.knownThreadIds.add(threadId);
 }
 
-function bindConnectionToThread(connectionId: number, threadId: string) {
-  let connectionsForThread = threadToConnectionIds.get(threadId);
-  if (!connectionsForThread) {
-    connectionsForThread = new Set<number>();
-    threadToConnectionIds.set(threadId, connectionsForThread);
+function inferThreadIdForServerRequest(session: AppServerSession, parsed: any): string | null {
+  const explicitThreadId = typeof parsed?.params?.threadId === 'string' ? parsed.params.threadId : null;
+  if (explicitThreadId) {
+    return explicitThreadId;
   }
-  connectionsForThread.add(connectionId);
-
-  let threadsForConnection = connectionToThreadIds.get(connectionId);
-  if (!threadsForConnection) {
-    threadsForConnection = new Set<string>();
-    connectionToThreadIds.set(connectionId, threadsForConnection);
+  const known = [...session.knownThreadIds];
+  if (known.length === 1) {
+    return known[0] ?? null;
   }
-  threadsForConnection.add(threadId);
+  return null;
 }
 
-function unbindConnectionFromAllThreads(connectionId: number) {
-  const threadsForConnection = connectionToThreadIds.get(connectionId);
-  if (!threadsForConnection) {
-    return;
+function sseFrameFromPayload(id: number, payload: string): string {
+  const lines = payload.split('\n');
+  const data = lines.map((line) => `data: ${line}`).join('\n');
+  return `id: ${id}\n${data}\n\n`;
+}
+
+async function ensureThreadNextEventId(threadId: string): Promise<number> {
+  const known = threadNextEventId.get(threadId);
+  if (known !== undefined) {
+    return known;
   }
-  for (const threadId of threadsForConnection) {
-    const connectionsForThread = threadToConnectionIds.get(threadId);
-    if (!connectionsForThread) {
-      continue;
+  const events = await readThreadEvents(threadId);
+  const next = events.length + 1;
+  threadNextEventId.set(threadId, next);
+  return next;
+}
+
+function publishThreadEvent(threadId: string, payload: string) {
+  const prior = threadPublishChains.get(threadId) ?? Promise.resolve();
+  const next = prior.then(async () => {
+    await appendThreadEvent(threadId, payload);
+    const id = await ensureThreadNextEventId(threadId);
+    threadNextEventId.set(threadId, id + 1);
+    const frame = sseFrameFromPayload(id, payload);
+    const subscribers = threadSseSubscribers.get(threadId);
+    if (!subscribers) {
+      return;
     }
-    connectionsForThread.delete(connectionId);
-    if (connectionsForThread.size === 0) {
-      threadToConnectionIds.delete(threadId);
-    }
-  }
-  connectionToThreadIds.delete(connectionId);
-}
-
-function sendToConnection(connectionId: number, payload: string, direction: 'app-server->client' | 'client->app-server' = 'app-server->client') {
-  const ws = activeWsConnections.get(connectionId);
-  if (!ws || ws.readyState !== 1) {
-    return false;
-  }
-  if (direction === 'app-server->client') {
-    ws.data.appServerMessageCount += 1;
-  } else {
-    ws.data.clientMessageCount += 1;
-  }
-  ws.send(payload);
-  return true;
-}
-
-function sendToThreadConnections(threadId: string, payload: string): boolean {
-  const connectionsForThread = threadToConnectionIds.get(threadId);
-  if (!connectionsForThread || connectionsForThread.size === 0) {
-    return false;
-  }
-
-  let deliveredAny = false;
-  for (const connectionId of Array.from(connectionsForThread)) {
-    const delivered = sendToConnection(connectionId, payload);
-    if (!delivered) {
-      connectionsForThread.delete(connectionId);
-      const threadsForConnection = connectionToThreadIds.get(connectionId);
-      if (threadsForConnection) {
-        threadsForConnection.delete(threadId);
-        if (threadsForConnection.size === 0) {
-          connectionToThreadIds.delete(connectionId);
-        }
+    for (const [subscriberId, sendFrame] of subscribers) {
+      try {
+        sendFrame(frame);
+      } catch {
+        subscribers.delete(subscriberId);
       }
-      continue;
     }
-    deliveredAny = true;
-  }
-
-  if (connectionsForThread.size === 0) {
-    threadToConnectionIds.delete(threadId);
-  }
-  return deliveredAny;
+    if (subscribers.size === 0) {
+      threadSseSubscribers.delete(threadId);
+    }
+  });
+  threadPublishChains.set(
+    threadId,
+    next.catch(() => {
+      // Keep the chain alive for subsequent events after an intermittent failure.
+    }),
+  );
+  return next;
 }
 
-function spawnAppServerSession(connectionId: number): AppServerSession {
+function registerPendingThreadInteractionRequest(
+  threadId: string,
+  requestId: string,
+  value: { sessionId: number; upstreamRequestId: number; method: string; params: any },
+) {
+  let requests = pendingThreadInteractionRequests.get(threadId);
+  if (!requests) {
+    requests = new Map();
+    pendingThreadInteractionRequests.set(threadId, requests);
+  }
+  requests.set(requestId, value);
+}
+
+function resolvePendingThreadInteractionRequest(threadId: string, requestId: string) {
+  const requests = pendingThreadInteractionRequests.get(threadId);
+  if (!requests) {
+    return null;
+  }
+  const found = requests.get(requestId) ?? null;
+  if (!found) {
+    return null;
+  }
+  requests.delete(requestId);
+  if (requests.size === 0) {
+    pendingThreadInteractionRequests.delete(threadId);
+  }
+  return found;
+}
+
+function spawnAppServerSession(): AppServerSession {
   const child = spawn('codex', ['app-server'], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -419,18 +417,14 @@ function spawnAppServerSession(connectionId: number): AppServerSession {
     id: ++appServerSessionCounter,
     child,
     stdoutBuffer: '',
-    turnInProgress: false,
-    shutdownAfterTurnComplete: false,
-    attachedConnectionIds: new Set<number>(),
+    upstreamInitialized: false,
     knownThreadIds: new Set<string>(),
     nextUpstreamRequestId: 1_000_000,
     pendingClientRequests: new Map(),
-    pendingServerRequestTargets: new Map(),
-    lastRequesterConnectionId: null,
   };
   appServerSessions.set(session.id, session);
   child.stderr.on('data', (chunk) => {
-    process.stderr.write(`[app-server session=${session.id} conn=${connectionId}] ${String(chunk)}`);
+    process.stderr.write(`[app-server session=${session.id}] ${String(chunk)}`);
   });
   if (child.stdout) {
     child.stdout.on('data', (chunk) => {
@@ -457,66 +451,53 @@ function spawnAppServerSession(connectionId: number): AppServerSession {
           const route = session.pendingClientRequests.get(parsed.id);
           if (route) {
             session.pendingClientRequests.delete(parsed.id);
-            const outbound = { ...parsed, id: route.clientRequestId };
-
             if (route.method === 'thread/start' || route.method === 'thread/read' || route.method === 'thread/resume') {
               const threadId = parsed?.result?.thread?.id;
               if (typeof threadId === 'string') {
                 bindThreadToSession(threadId, session);
-                bindConnectionToThread(route.connectionId, threadId);
                 if ((route.method === 'thread/read' || route.method === 'thread/resume') && parsed?.result?.thread?.turns) {
                   void rehydrateThreadEventsFromRead(threadId, parsed.result);
                 }
               }
             }
 
-            void sendToConnection(route.connectionId, JSON.stringify(outbound));
-            continue;
-          }
-          if (session.pendingServerRequestTargets.has(parsed.id)) {
+            route.resolveHttp?.(parsed);
             continue;
           }
         }
 
         if (parsed && typeof parsed.id === 'number' && typeof parsed.method === 'string') {
-          const preferred = session.lastRequesterConnectionId;
-          const targetConnectionId =
-            (preferred !== null && session.attachedConnectionIds.has(preferred) ? preferred : [...session.attachedConnectionIds][0]) ?? null;
-          if (targetConnectionId !== null) {
-            session.pendingServerRequestTargets.set(parsed.id, targetConnectionId);
-            void sendToConnection(targetConnectionId, line);
+          const inferredThreadId = inferThreadIdForServerRequest(session, parsed);
+          if (inferredThreadId) {
+            bindThreadToSession(inferredThreadId, session);
+            const requestId = String(parsed.id);
+            registerPendingThreadInteractionRequest(inferredThreadId, requestId, {
+              sessionId: session.id,
+              upstreamRequestId: parsed.id,
+              method: parsed.method,
+              params: parsed.params ?? {},
+            });
+            void publishThreadEvent(
+              inferredThreadId,
+              JSON.stringify({
+                method: 'darkhold/interaction/request',
+                params: {
+                  threadId: inferredThreadId,
+                  requestId,
+                  method: parsed.method,
+                  params: parsed.params ?? {},
+                },
+              }),
+            );
           }
           continue;
         }
 
         if (parsed && typeof parsed.method === 'string') {
           const threadId = parsed?.params?.threadId;
-          let deliveredViaThreadSubscription = false;
           if (typeof threadId === 'string') {
             bindThreadToSession(threadId, session);
-            void appendThreadEvent(threadId, line);
-            deliveredViaThreadSubscription = sendToThreadConnections(threadId, line);
-          }
-          if (parsed.method === 'turn/started') {
-            session.turnInProgress = true;
-          }
-          if (parsed.method === 'turn/completed') {
-            session.turnInProgress = false;
-            if (session.shutdownAfterTurnComplete && session.attachedConnectionIds.size === 0) {
-              logProxy(`session=${session.id} turn completed while detached, shutting down app-server`);
-              void stopChildGracefully(session.child);
-            }
-          }
-
-          if (deliveredViaThreadSubscription) {
-            continue;
-          }
-        }
-
-        for (const attachedConnectionId of session.attachedConnectionIds) {
-          const delivered = sendToConnection(attachedConnectionId, line);
-          if (!delivered) {
-            session.attachedConnectionIds.delete(attachedConnectionId);
+            void publishThreadEvent(threadId, line);
           }
         }
       }
@@ -525,55 +506,101 @@ function spawnAppServerSession(connectionId: number): AppServerSession {
   child.on('exit', (code, signal) => {
     logProxy(`session=${session.id} app-server exited code=${code ?? 'null'} signal=${signal ?? 'null'}`);
     activeAppServerChildren.delete(child);
-    appServerSessions.delete(session.id);
-    const reusableIndex = reusableAppServerSessionIds.indexOf(session.id);
-    if (reusableIndex >= 0) {
-      reusableAppServerSessionIds.splice(reusableIndex, 1);
+    for (const [threadId, requests] of pendingThreadInteractionRequests) {
+      for (const [requestId, value] of requests) {
+        if (value.sessionId === session.id) {
+          requests.delete(requestId);
+        }
+      }
+      if (requests.size === 0) {
+        pendingThreadInteractionRequests.delete(threadId);
+      }
     }
+    for (const route of session.pendingClientRequests.values()) {
+      route.rejectHttp?.(new Error('app-server exited'));
+    }
+    appServerSessions.delete(session.id);
     for (const threadId of session.knownThreadIds) {
       if (threadToSessionId.get(threadId) === session.id) {
         threadToSessionId.delete(threadId);
-      }
-    }
-    for (const connectionId of session.attachedConnectionIds) {
-      const attachedWs = activeWsConnections.get(connectionId);
-      if (attachedWs && attachedWs.readyState === 1) {
-        attachedWs.close(1011, 'app-server exited');
       }
     }
   });
   return session;
 }
 
-function attachSessionToConnection(session: AppServerSession, ws: ServerWebSocketLike) {
-  session.attachedConnectionIds.add(ws.data.connectionId);
-  session.shutdownAfterTurnComplete = false;
-  ws.data.appServerId = session.id;
-  const reusableIndex = reusableAppServerSessionIds.indexOf(session.id);
-  if (reusableIndex >= 0) {
-    reusableAppServerSessionIds.splice(reusableIndex, 1);
+function selectSession(threadIdHint: string | null): AppServerSession {
+  if (threadIdHint) {
+    const mappedSessionId = threadToSessionId.get(threadIdHint) ?? null;
+    if (mappedSessionId !== null) {
+      const mappedSession = appServerSessions.get(mappedSessionId) ?? null;
+      if (mappedSession && mappedSession.child.exitCode === null && !mappedSession.child.killed) {
+        return mappedSession;
+      }
+    }
   }
+
+  for (const session of appServerSessions.values()) {
+    if (session.child.exitCode === null && !session.child.killed) {
+      return session;
+    }
+  }
+
+  return spawnAppServerSession();
 }
 
-function takeReusableSession(): AppServerSession | null {
-  while (reusableAppServerSessionIds.length > 0) {
-    const sessionId = reusableAppServerSessionIds.shift();
-    if (sessionId === undefined) {
-      return null;
-    }
-    const session = appServerSessions.get(sessionId);
-    if (!session) {
-      continue;
-    }
-    if (session.child.exitCode !== null || session.child.killed) {
-      continue;
-    }
-    if (session.attachedConnectionIds.size > 0) {
-      continue;
-    }
-    return session;
+async function requestSessionRpc(session: AppServerSession, method: string, params: unknown): Promise<any> {
+  const appServer = session.child;
+  const stdin = appServer.stdin;
+  if (appServer.exitCode !== null || appServer.killed || !stdin) {
+    throw new Error('app-server is unavailable');
   }
-  return null;
+
+  return await new Promise<any>((resolve, reject) => {
+    const upstreamId = session.nextUpstreamRequestId;
+    session.nextUpstreamRequestId += 1;
+
+    const timeout = setTimeout(() => {
+      if (!session.pendingClientRequests.has(upstreamId)) {
+        return;
+      }
+      session.pendingClientRequests.delete(upstreamId);
+      reject(new Error(`RPC request timed out: ${method}`));
+    }, 20_000);
+
+    session.pendingClientRequests.set(upstreamId, {
+      method,
+      resolveHttp: (payload) => {
+        clearTimeout(timeout);
+        resolve(payload);
+      },
+      rejectHttp: (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    });
+
+    const outbound = JSON.stringify({ id: upstreamId, method, params });
+    tapRpcFrame('client->app-server', outbound);
+    stdin.write(outbound.endsWith('\n') ? outbound : `${outbound}\n`);
+  });
+}
+
+async function ensureSessionInitialized(session: AppServerSession): Promise<void> {
+  if (session.upstreamInitialized) {
+    return;
+  }
+  const response = await requestSessionRpc(session, 'initialize', {
+    clientInfo: { name: 'darkhold-http', title: 'Darkhold HTTP', version: '0.1.0' },
+    capabilities: { experimentalApi: true },
+  });
+  if (response?.error) {
+    const message = String(response.error?.message ?? '');
+    if (!message.toLowerCase().includes('already initialized')) {
+      throw new Error(message || 'Failed to initialize app-server session.');
+    }
+  }
+  session.upstreamInitialized = true;
 }
 
 async function stopChildGracefully(child: ChildProcess, timeoutMs = 1500): Promise<void> {
@@ -601,7 +628,7 @@ const [cachedIndexHtml, cachedStylesCss, cachedAppJs] = isDevLive
   ? [null, null, null]
   : await Promise.all([loadFrontendAsset('index.html'), loadFrontendAsset('styles.css'), buildFrontendBundle()]);
 
-const server = Bun.serve<WsProxyData>({
+const server = Bun.serve({
   hostname: config.bind,
   port: config.port,
   async fetch(req, server) {
@@ -616,24 +643,6 @@ const server = Bun.serve<WsProxyData>({
       return json({ ok: true, basePath: getHomeRoot() });
     }
 
-    if (req.method === 'GET' && url.pathname === '/api/rpc/ws') {
-      const desiredThreadIdRaw = url.searchParams.get('threadId');
-      const desiredThreadId = desiredThreadIdRaw && desiredThreadIdRaw.trim().length > 0 ? desiredThreadIdRaw.trim() : null;
-      const upgraded = server.upgrade(req, {
-        data: {
-          connectionId: 0,
-          clientMessageCount: 0,
-          appServerMessageCount: 0,
-          appServerId: null,
-          desiredThreadId,
-        },
-      });
-      if (upgraded) {
-        return;
-      }
-      return json({ error: 'WebSocket upgrade failed.' }, 400);
-    }
-
     if (req.method === 'GET' && url.pathname === '/api/thread/events') {
       const threadId = (url.searchParams.get('threadId') ?? '').trim();
       if (!threadId) {
@@ -641,6 +650,156 @@ const server = Bun.serve<WsProxyData>({
       }
       const events = await readThreadEvents(threadId);
       return json({ threadId, events });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/thread/events/stream') {
+      const threadId = (url.searchParams.get('threadId') ?? '').trim();
+      if (!threadId) {
+        return json({ error: 'threadId is required.' }, 400);
+      }
+      const headerLastEventId = req.headers.get('last-event-id');
+      const queryLastEventId = url.searchParams.get('lastEventId');
+      const lastEventIdRaw = (headerLastEventId ?? queryLastEventId ?? '').trim();
+      const lastEventIdParsed = Number.parseInt(lastEventIdRaw, 10);
+      const startEventId = Number.isFinite(lastEventIdParsed) && lastEventIdParsed >= 0 ? lastEventIdParsed + 1 : 1;
+      const history = await readThreadEvents(threadId);
+      const nextIdFromHistory = history.length + 1;
+      const existingNextId = threadNextEventId.get(threadId);
+      if (existingNextId === undefined || existingNextId < nextIdFromHistory) {
+        threadNextEventId.set(threadId, nextIdFromHistory);
+      }
+
+      const encoder = new TextEncoder();
+      const subscriberId = ++threadSseSubscriberCounter;
+      let cleanup: (() => void) | null = null;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const sendFrame = (frame: string) => {
+            controller.enqueue(encoder.encode(frame));
+          };
+
+          for (let index = Math.max(0, startEventId - 1); index < history.length; index += 1) {
+            const frame = sseFrameFromPayload(index + 1, history[index] ?? '');
+            sendFrame(frame);
+          }
+
+          let subscribers = threadSseSubscribers.get(threadId);
+          if (!subscribers) {
+            subscribers = new Map();
+            threadSseSubscribers.set(threadId, subscribers);
+          }
+          subscribers.set(subscriberId, sendFrame);
+
+          const keepAlive = setInterval(() => {
+            sendFrame(': keepalive\n\n');
+          }, 15_000);
+
+          cleanup = () => {
+            clearInterval(keepAlive);
+            const currentSubscribers = threadSseSubscribers.get(threadId);
+            if (currentSubscribers) {
+              currentSubscribers.delete(subscriberId);
+              if (currentSubscribers.size === 0) {
+                threadSseSubscribers.delete(threadId);
+              }
+            }
+          };
+
+          req.signal.addEventListener(
+            'abort',
+            () => {
+              cleanup?.();
+            },
+            { once: true },
+          );
+        },
+        cancel() {
+          cleanup?.();
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache, no-transform',
+          connection: 'keep-alive',
+        },
+      });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/rpc') {
+      let body: any = null;
+      try {
+        body = await req.json();
+      } catch {
+        return json({ error: 'Invalid JSON body.' }, 400);
+      }
+
+      const method = typeof body?.method === 'string' ? body.method : '';
+      if (!method) {
+        return json({ error: 'method is required.' }, 400);
+      }
+      const params = body?.params;
+      const threadIdHint = typeof params?.threadId === 'string' ? params.threadId : null;
+
+      try {
+        const session = selectSession(threadIdHint);
+        if (threadIdHint) {
+          bindThreadToSession(threadIdHint, session);
+        }
+        if (method !== 'initialize') {
+          await ensureSessionInitialized(session);
+        }
+        const response = await requestSessionRpc(session, method, params);
+        if (response?.error) {
+          return json({ error: String(response.error?.message ?? 'RPC error') }, 400);
+        }
+        return json(response?.result ?? null);
+      } catch (error: unknown) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/thread/interaction/respond') {
+      let body: any = null;
+      try {
+        body = await req.json();
+      } catch {
+        return json({ error: 'Invalid JSON body.' }, 400);
+      }
+
+      const threadId = typeof body?.threadId === 'string' ? body.threadId.trim() : '';
+      const requestId = typeof body?.requestId === 'string' ? body.requestId.trim() : '';
+      if (!threadId || !requestId) {
+        return json({ error: 'threadId and requestId are required.' }, 400);
+      }
+
+      const resolved = resolvePendingThreadInteractionRequest(threadId, requestId);
+      if (!resolved) {
+        return json({ error: 'interaction request not found or already resolved.' }, 409);
+      }
+
+      const session = appServerSessions.get(resolved.sessionId) ?? null;
+      if (!session || !session.child.stdin || session.child.exitCode !== null || session.child.killed) {
+        return json({ error: 'app-server session is unavailable.' }, 410);
+      }
+
+      const outbound =
+        body?.error !== undefined
+          ? JSON.stringify({ id: resolved.upstreamRequestId, error: body.error })
+          : JSON.stringify({ id: resolved.upstreamRequestId, result: body?.result ?? {} });
+      tapRpcFrame('client->app-server', outbound);
+      session.child.stdin.write(outbound.endsWith('\n') ? outbound : `${outbound}\n`);
+
+      void publishThreadEvent(
+        threadId,
+        JSON.stringify({
+          method: 'darkhold/interaction/resolved',
+          params: { threadId, requestId, source: 'http' },
+        }),
+      );
+
+      return json({ ok: true });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/fs/list') {
@@ -683,177 +842,12 @@ const server = Bun.serve<WsProxyData>({
 
     return new Response('Not found', { status: 404 });
   },
-  websocket: {
-    open(ws) {
-      const connectionId = ++wsProxyConnectionCounter;
-      ws.data.connectionId = connectionId;
-      ws.data.clientMessageCount = 0;
-      ws.data.appServerMessageCount = 0;
-      ws.data.appServerId = null;
-      activeWsConnections.set(connectionId, ws);
-
-      logProxy(`conn=${connectionId} client websocket opened`);
-      if (ws.data.desiredThreadId) {
-        bindConnectionToThread(connectionId, ws.data.desiredThreadId);
-        const mappedSessionId = threadToSessionId.get(ws.data.desiredThreadId) ?? null;
-        if (mappedSessionId !== null) {
-          const mappedSession = appServerSessions.get(mappedSessionId) ?? null;
-          if (mappedSession && mappedSession.child.exitCode === null && !mappedSession.child.killed) {
-            attachSessionToConnection(mappedSession, ws);
-            logProxy(`conn=${connectionId} attached to mapped session=${mappedSession.id} for thread=${ws.data.desiredThreadId}`);
-          }
-        }
-      }
-    },
-    message(ws, message) {
-      const connectionId = ws.data.connectionId;
-      const payload = normalizeRpcPayload(message as any);
-      let parsed: any = null;
-      try {
-        parsed = JSON.parse(payload);
-      } catch {
-        parsed = null;
-      }
-
-      if (parsed && typeof parsed.id === 'number' && parsed.method === 'darkhold/thread/events') {
-        const threadId = typeof parsed?.params?.threadId === 'string' ? parsed.params.threadId : '';
-        void (async () => {
-          const events = threadId ? await readThreadEvents(threadId) : [];
-          const response = {
-            id: parsed.id,
-            result: {
-              threadId,
-              events,
-            },
-          };
-          void sendToConnection(connectionId, JSON.stringify(response));
-        })();
-        return;
-      }
-
-      const threadIdHint = typeof parsed?.params?.threadId === 'string' ? parsed.params.threadId : null;
-      if (threadIdHint) {
-        bindConnectionToThread(connectionId, threadIdHint);
-      }
-      let session = sessionForConnection(ws);
-      if (threadIdHint) {
-        const mappedSessionId = threadToSessionId.get(threadIdHint) ?? null;
-        if (mappedSessionId !== null) {
-          const mappedSession = appServerSessions.get(mappedSessionId) ?? null;
-          if (mappedSession && mappedSession.child.exitCode === null && !mappedSession.child.killed) {
-            if (!session || session.id !== mappedSession.id) {
-              if (session) {
-                session.attachedConnectionIds.delete(connectionId);
-              }
-              attachSessionToConnection(mappedSession, ws);
-              session = mappedSession;
-            }
-          }
-        }
-      }
-
-      if (!session) {
-        const reusableSession = takeReusableSession();
-        if (reusableSession) {
-          attachSessionToConnection(reusableSession, ws);
-          session = reusableSession;
-        } else {
-          const spawned = spawnAppServerSession(connectionId);
-          attachSessionToConnection(spawned, ws);
-          session = spawned;
-        }
-      }
-
-      const appServer = session.child;
-      if (appServer.exitCode !== null || appServer.killed || !appServer.stdin) {
-        logProxy(`conn=${connectionId} dropping client message because app-server is unavailable`);
-        return;
-      }
-
-      if (parsed && typeof parsed.id === 'number' && typeof parsed.method !== 'string') {
-        const target = session.pendingServerRequestTargets.get(parsed.id);
-        if (target === connectionId) {
-          session.pendingServerRequestTargets.delete(parsed.id);
-          ws.data.clientMessageCount += 1;
-          tapRpcFrame('client->app-server', payload);
-          appServer.stdin.write(payload.endsWith('\n') ? payload : `${payload}\n`);
-        }
-        return;
-      }
-
-      if (parsed && typeof parsed.id === 'number' && typeof parsed.method === 'string') {
-        const upstreamId = session.nextUpstreamRequestId;
-        session.nextUpstreamRequestId += 1;
-        session.pendingClientRequests.set(upstreamId, {
-          connectionId,
-          clientRequestId: parsed.id,
-          method: parsed.method,
-        });
-
-        if (parsed.method === 'turn/start') {
-          session.turnInProgress = true;
-        }
-        if (threadIdHint) {
-          bindThreadToSession(threadIdHint, session);
-        }
-
-        const outbound = JSON.stringify({ ...parsed, id: upstreamId });
-        session.lastRequesterConnectionId = connectionId;
-        ws.data.clientMessageCount += 1;
-        tapRpcFrame('client->app-server', outbound);
-        appServer.stdin.write(outbound.endsWith('\n') ? outbound : `${outbound}\n`);
-        return;
-      }
-
-      if (threadIdHint) {
-        bindThreadToSession(threadIdHint, session);
-      }
-      session.lastRequesterConnectionId = connectionId;
-      ws.data.clientMessageCount += 1;
-      tapRpcFrame('client->app-server', payload);
-      appServer.stdin.write(payload.endsWith('\n') ? payload : `${payload}\n`);
-    },
-    close(ws) {
-      const connectionId = ws.data.connectionId;
-      logProxy(
-        `conn=${connectionId} client websocket closed stats(client->app-server=${ws.data.clientMessageCount}, app-server->client=${ws.data.appServerMessageCount})`,
-      );
-      activeWsConnections.delete(connectionId);
-      unbindConnectionFromAllThreads(connectionId);
-      const session = sessionForConnection(ws);
-      if (session) {
-        session.attachedConnectionIds.delete(connectionId);
-        for (const [requestId, targetConnectionId] of session.pendingServerRequestTargets) {
-          if (targetConnectionId === connectionId) {
-            session.pendingServerRequestTargets.delete(requestId);
-          }
-        }
-        for (const [requestId, route] of session.pendingClientRequests) {
-          if (route.connectionId === connectionId) {
-            session.pendingClientRequests.delete(requestId);
-          }
-        }
-      }
-      if (session && session.attachedConnectionIds.size === 0) {
-        if (session.turnInProgress) {
-          session.shutdownAfterTurnComplete = true;
-          if (!reusableAppServerSessionIds.includes(session.id)) {
-            reusableAppServerSessionIds.push(session.id);
-          }
-          logProxy(`conn=${connectionId} detached from session=${session.id}; waiting for turn/completed`);
-        } else {
-          void stopChildGracefully(session.child);
-        }
-      }
-      ws.data.appServerId = null;
-    },
-  },
 });
 
 const allowListNote =
   config.allowCidrs.length > 0 ? ` (allowed CIDRs: ${config.allowCidrs.join(', ')}, plus localhost)` : '';
 console.log(
-  `darkhold listening on http://${config.bind}:${server.port}${allowListNote} (base path: ${getHomeRoot()}, app-server transport: stdio per websocket)`,
+  `darkhold listening on http://${config.bind}:${server.port}${allowListNote} (base path: ${getHomeRoot()}, app-server transport: stdio per session)`,
 );
 
 let shutdownStarted = false;
