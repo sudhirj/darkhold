@@ -99,10 +99,10 @@ export function AgentThreadPanel({
                 </div>
               </li>
             ))}
-            <li className="list-group-item border-0 p-0" aria-hidden="true">
+            <li className="list-group-item border-0 bg-transparent p-0" aria-hidden="true">
               <div className="event-log-bottom-spacer" />
             </li>
-            <li className="list-group-item border-0 p-0" aria-hidden="true">
+            <li className="list-group-item border-0 bg-transparent p-0" aria-hidden="true">
               <div ref={conversationEndRef} className="event-log-bottom-sentinel" />
             </li>
           </ul>

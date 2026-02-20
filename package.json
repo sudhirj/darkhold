@@ -11,6 +11,7 @@
     "build:server": "bun build src/server/index.ts --outfile dist/server.js --target bun --format esm --minify",
     "build": "mkdir -p dist/public && bun run build:web && cp src/web/index.html dist/public/index.html && cp src/web/styles.css dist/public/styles.css && bun run build:server",
     "bundle": "mkdir -p dist && bun build src/server/index.ts --compile --outfile dist/darkhold",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

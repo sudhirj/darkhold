@@ -888,7 +888,11 @@ function App() {
 
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      const wsUrl = `${protocol}://${window.location.host}/api/rpc/ws`;
+      const reconnectThreadId = activeThreadIdRef.current ?? readSessionIdFromUrl();
+      const wsUrl =
+        reconnectThreadId && reconnectThreadId.trim().length > 0
+          ? `${protocol}://${window.location.host}/api/rpc/ws?threadId=${encodeURIComponent(reconnectThreadId)}`
+          : `${protocol}://${window.location.host}/api/rpc/ws`;
 
       rpcRef.current?.close({ suppressHandler: true });
       const rpc = new RpcClient();

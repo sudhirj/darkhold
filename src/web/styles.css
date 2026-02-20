@@ -33,6 +33,11 @@ input,
 
 .event-log {
   white-space: pre-wrap;
+  background: transparent;
+}
+
+.event-log > .list-group-item {
+  background: transparent;
 }
 
 .turn-event-group {

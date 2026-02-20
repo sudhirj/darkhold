@@ -1,7 +1,8 @@
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { ChildProcess, spawn } from 'node:child_process';
 import { getHomeRoot, listFolder, setBrowserRoot } from '../fs/home-browser';
+import { createThreadEventLogStore } from './thread-event-log';
 
 type ServerConfig = {
   bind: string;
@@ -15,8 +16,29 @@ type WsProxyData = {
   connectionId: number;
   clientMessageCount: number;
   appServerMessageCount: number;
-  appServer: ChildProcess | null;
+  appServerId: number | null;
+  desiredThreadId: string | null;
+};
+
+type AppServerSession = {
+  id: number;
+  child: ChildProcess;
   stdoutBuffer: string;
+  turnInProgress: boolean;
+  shutdownAfterTurnComplete: boolean;
+  attachedConnectionIds: Set<number>;
+  knownThreadIds: Set<string>;
+  nextUpstreamRequestId: number;
+  pendingClientRequests: Map<number, { connectionId: number; clientRequestId: number; method: string }>;
+  pendingServerRequestTargets: Map<number, number>;
+  lastRequesterConnectionId: number | null;
+};
+
+type ServerWebSocketLike = {
+  readyState: number;
+  data: WsProxyData;
+  send: (data: string) => void;
+  close: (code?: number, reason?: string) => void;
 };
 
 function normalizeRpcPayload(payload: string | ArrayBuffer | Uint8Array): string {
@@ -272,23 +294,214 @@ async function buildFrontendBundle(): Promise<string> {
 
 const isDevLive = process.env.DARKHOLD_DEV === '1';
 
+const eventsTmpRoot = path.join('/tmp', `darkhold-events-${process.pid}`);
+const threadEventLog = createThreadEventLogStore(eventsTmpRoot);
 const config = parseConfig(process.argv.slice(2));
 await setBrowserRoot(config.basePath);
+await mkdir(eventsTmpRoot, { recursive: true });
 let wsProxyConnectionCounter = 0;
+let appServerSessionCounter = 0;
+const activeWsConnections = new Map<number, ServerWebSocketLike>();
 const activeAppServerChildren = new Set<ChildProcess>();
+const appServerSessions = new Map<number, AppServerSession>();
+const reusableAppServerSessionIds: number[] = [];
+const threadToSessionId = new Map<string, number>();
 
-function spawnAppServerForConnection(connectionId: number): ChildProcess {
+function sessionForConnection(ws: ServerWebSocketLike): AppServerSession | null {
+  if (ws.data.appServerId === null) {
+    return null;
+  }
+  return appServerSessions.get(ws.data.appServerId) ?? null;
+}
+
+async function appendThreadEvent(threadId: string, payload: string) {
+  await threadEventLog.append(threadId, payload);
+}
+
+async function readThreadEvents(threadId: string): Promise<string[]> {
+  return await threadEventLog.read(threadId);
+}
+
+async function rehydrateThreadEventsFromRead(threadId: string, readResult: any): Promise<void> {
+  await threadEventLog.rehydrateFromThreadRead(threadId, readResult);
+}
+
+function bindThreadToSession(threadId: string, session: AppServerSession) {
+  threadToSessionId.set(threadId, session.id);
+  session.knownThreadIds.add(threadId);
+}
+
+function sendToConnection(connectionId: number, payload: string, direction: 'app-server->client' | 'client->app-server' = 'app-server->client') {
+  const ws = activeWsConnections.get(connectionId);
+  if (!ws || ws.readyState !== 1) {
+    return false;
+  }
+  if (direction === 'app-server->client') {
+    ws.data.appServerMessageCount += 1;
+  } else {
+    ws.data.clientMessageCount += 1;
+  }
+  ws.send(payload);
+  return true;
+}
+
+function spawnAppServerSession(connectionId: number): AppServerSession {
   const child = spawn('codex', ['app-server'], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   activeAppServerChildren.add(child);
+  const session: AppServerSession = {
+    id: ++appServerSessionCounter,
+    child,
+    stdoutBuffer: '',
+    turnInProgress: false,
+    shutdownAfterTurnComplete: false,
+    attachedConnectionIds: new Set<number>(),
+    knownThreadIds: new Set<string>(),
+    nextUpstreamRequestId: 1_000_000,
+    pendingClientRequests: new Map(),
+    pendingServerRequestTargets: new Map(),
+    lastRequesterConnectionId: null,
+  };
+  appServerSessions.set(session.id, session);
   child.stderr.on('data', (chunk) => {
-    process.stderr.write(`[app-server conn=${connectionId}] ${String(chunk)}`);
+    process.stderr.write(`[app-server session=${session.id} conn=${connectionId}] ${String(chunk)}`);
   });
-  child.on('exit', () => {
+  if (child.stdout) {
+    child.stdout.on('data', (chunk) => {
+      session.stdoutBuffer += String(chunk);
+      while (true) {
+        const newlineIndex = session.stdoutBuffer.indexOf('\n');
+        if (newlineIndex < 0) {
+          break;
+        }
+        const line = session.stdoutBuffer.slice(0, newlineIndex).trim();
+        session.stdoutBuffer = session.stdoutBuffer.slice(newlineIndex + 1);
+        if (!line) {
+          continue;
+        }
+        tapRpcFrame('app-server->client', line);
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          parsed = null;
+        }
+
+        if (parsed && typeof parsed.id === 'number' && ('result' in parsed || 'error' in parsed)) {
+          const route = session.pendingClientRequests.get(parsed.id);
+          if (route) {
+            session.pendingClientRequests.delete(parsed.id);
+            const outbound = { ...parsed, id: route.clientRequestId };
+
+            if (route.method === 'thread/start' || route.method === 'thread/read' || route.method === 'thread/resume') {
+              const threadId = parsed?.result?.thread?.id;
+              if (typeof threadId === 'string') {
+                bindThreadToSession(threadId, session);
+                if ((route.method === 'thread/read' || route.method === 'thread/resume') && parsed?.result?.thread?.turns) {
+                  void rehydrateThreadEventsFromRead(threadId, parsed.result);
+                }
+              }
+            }
+
+            void sendToConnection(route.connectionId, JSON.stringify(outbound));
+            continue;
+          }
+          if (session.pendingServerRequestTargets.has(parsed.id)) {
+            continue;
+          }
+        }
+
+        if (parsed && typeof parsed.id === 'number' && typeof parsed.method === 'string') {
+          const preferred = session.lastRequesterConnectionId;
+          const targetConnectionId =
+            (preferred !== null && session.attachedConnectionIds.has(preferred) ? preferred : [...session.attachedConnectionIds][0]) ?? null;
+          if (targetConnectionId !== null) {
+            session.pendingServerRequestTargets.set(parsed.id, targetConnectionId);
+            void sendToConnection(targetConnectionId, line);
+          }
+          continue;
+        }
+
+        if (parsed && typeof parsed.method === 'string') {
+          const threadId = parsed?.params?.threadId;
+          if (typeof threadId === 'string') {
+            bindThreadToSession(threadId, session);
+            void appendThreadEvent(threadId, line);
+          }
+          if (parsed.method === 'turn/started') {
+            session.turnInProgress = true;
+          }
+          if (parsed.method === 'turn/completed') {
+            session.turnInProgress = false;
+            if (session.shutdownAfterTurnComplete && session.attachedConnectionIds.size === 0) {
+              logProxy(`session=${session.id} turn completed while detached, shutting down app-server`);
+              void stopChildGracefully(session.child);
+            }
+          }
+        }
+
+        for (const attachedConnectionId of session.attachedConnectionIds) {
+          const delivered = sendToConnection(attachedConnectionId, line);
+          if (!delivered) {
+            session.attachedConnectionIds.delete(attachedConnectionId);
+          }
+        }
+      }
+    });
+  }
+  child.on('exit', (code, signal) => {
+    logProxy(`session=${session.id} app-server exited code=${code ?? 'null'} signal=${signal ?? 'null'}`);
     activeAppServerChildren.delete(child);
+    appServerSessions.delete(session.id);
+    const reusableIndex = reusableAppServerSessionIds.indexOf(session.id);
+    if (reusableIndex >= 0) {
+      reusableAppServerSessionIds.splice(reusableIndex, 1);
+    }
+    for (const threadId of session.knownThreadIds) {
+      if (threadToSessionId.get(threadId) === session.id) {
+        threadToSessionId.delete(threadId);
+      }
+    }
+    for (const connectionId of session.attachedConnectionIds) {
+      const attachedWs = activeWsConnections.get(connectionId);
+      if (attachedWs && attachedWs.readyState === 1) {
+        attachedWs.close(1011, 'app-server exited');
+      }
+    }
   });
-  return child;
+  return session;
+}
+
+function attachSessionToConnection(session: AppServerSession, ws: ServerWebSocketLike) {
+  session.attachedConnectionIds.add(ws.data.connectionId);
+  session.shutdownAfterTurnComplete = false;
+  ws.data.appServerId = session.id;
+  const reusableIndex = reusableAppServerSessionIds.indexOf(session.id);
+  if (reusableIndex >= 0) {
+    reusableAppServerSessionIds.splice(reusableIndex, 1);
+  }
+}
+
+function takeReusableSession(): AppServerSession | null {
+  while (reusableAppServerSessionIds.length > 0) {
+    const sessionId = reusableAppServerSessionIds.shift();
+    if (sessionId === undefined) {
+      return null;
+    }
+    const session = appServerSessions.get(sessionId);
+    if (!session) {
+      continue;
+    }
+    if (session.child.exitCode !== null || session.child.killed) {
+      continue;
+    }
+    if (session.attachedConnectionIds.size > 0) {
+      continue;
+    }
+    return session;
+  }
+  return null;
 }
 
 async function stopChildGracefully(child: ChildProcess, timeoutMs = 1500): Promise<void> {
@@ -332,19 +545,30 @@ const server = Bun.serve<WsProxyData>({
     }
 
     if (req.method === 'GET' && url.pathname === '/api/rpc/ws') {
+      const desiredThreadIdRaw = url.searchParams.get('threadId');
+      const desiredThreadId = desiredThreadIdRaw && desiredThreadIdRaw.trim().length > 0 ? desiredThreadIdRaw.trim() : null;
       const upgraded = server.upgrade(req, {
         data: {
           connectionId: 0,
           clientMessageCount: 0,
           appServerMessageCount: 0,
-          appServer: null,
-          stdoutBuffer: '',
+          appServerId: null,
+          desiredThreadId,
         },
       });
       if (upgraded) {
         return;
       }
       return json({ error: 'WebSocket upgrade failed.' }, 400);
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/thread/events') {
+      const threadId = (url.searchParams.get('threadId') ?? '').trim();
+      if (!threadId) {
+        return json({ error: 'threadId is required.' }, 400);
+      }
+      const events = await readThreadEvents(threadId);
+      return json({ threadId, events });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/fs/list') {
@@ -393,55 +617,123 @@ const server = Bun.serve<WsProxyData>({
       ws.data.connectionId = connectionId;
       ws.data.clientMessageCount = 0;
       ws.data.appServerMessageCount = 0;
-      ws.data.stdoutBuffer = '';
+      ws.data.appServerId = null;
+      activeWsConnections.set(connectionId, ws);
 
       logProxy(`conn=${connectionId} client websocket opened`);
-      const appServer = spawnAppServerForConnection(connectionId);
-      ws.data.appServer = appServer;
-
-      if (!appServer.stdout) {
-        logProxy(`conn=${connectionId} app-server stdout unavailable`);
-        ws.close(1011, 'app-server stdout unavailable');
-        return;
+      if (ws.data.desiredThreadId) {
+        const mappedSessionId = threadToSessionId.get(ws.data.desiredThreadId) ?? null;
+        if (mappedSessionId !== null) {
+          const mappedSession = appServerSessions.get(mappedSessionId) ?? null;
+          if (mappedSession && mappedSession.child.exitCode === null && !mappedSession.child.killed) {
+            attachSessionToConnection(mappedSession, ws);
+            logProxy(`conn=${connectionId} attached to mapped session=${mappedSession.id} for thread=${ws.data.desiredThreadId}`);
+          }
+        }
       }
-
-      appServer.stdout.on('data', (chunk) => {
-        ws.data.stdoutBuffer += String(chunk);
-        while (true) {
-          const newlineIndex = ws.data.stdoutBuffer.indexOf('\n');
-          if (newlineIndex < 0) {
-            break;
-          }
-          const line = ws.data.stdoutBuffer.slice(0, newlineIndex).trim();
-          ws.data.stdoutBuffer = ws.data.stdoutBuffer.slice(newlineIndex + 1);
-          if (!line) {
-            continue;
-          }
-          ws.data.appServerMessageCount += 1;
-          tapRpcFrame('app-server->client', line);
-          if (ws.readyState === 1) {
-            ws.send(line);
-          }
-        }
-      });
-
-      appServer.on('exit', (code, signal) => {
-        logProxy(`conn=${connectionId} app-server exited code=${code ?? 'null'} signal=${signal ?? 'null'}`);
-        ws.data.appServer = null;
-        if (ws.readyState === 1) {
-          ws.close(1011, 'app-server exited');
-        }
-      });
     },
     message(ws, message) {
       const connectionId = ws.data.connectionId;
-      const appServer = ws.data.appServer;
-      if (!appServer || appServer.exitCode !== null || appServer.killed || !appServer.stdin) {
+      const payload = normalizeRpcPayload(message as any);
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        parsed = null;
+      }
+
+      if (parsed && typeof parsed.id === 'number' && parsed.method === 'darkhold/thread/events') {
+        const threadId = typeof parsed?.params?.threadId === 'string' ? parsed.params.threadId : '';
+        void (async () => {
+          const events = threadId ? await readThreadEvents(threadId) : [];
+          const response = {
+            id: parsed.id,
+            result: {
+              threadId,
+              events,
+            },
+          };
+          void sendToConnection(connectionId, JSON.stringify(response));
+        })();
+        return;
+      }
+
+      const threadIdHint = typeof parsed?.params?.threadId === 'string' ? parsed.params.threadId : null;
+      let session = sessionForConnection(ws);
+      if (threadIdHint) {
+        const mappedSessionId = threadToSessionId.get(threadIdHint) ?? null;
+        if (mappedSessionId !== null) {
+          const mappedSession = appServerSessions.get(mappedSessionId) ?? null;
+          if (mappedSession && mappedSession.child.exitCode === null && !mappedSession.child.killed) {
+            if (!session || session.id !== mappedSession.id) {
+              if (session) {
+                session.attachedConnectionIds.delete(connectionId);
+              }
+              attachSessionToConnection(mappedSession, ws);
+              session = mappedSession;
+            }
+          }
+        }
+      }
+
+      if (!session) {
+        const reusableSession = takeReusableSession();
+        if (reusableSession) {
+          attachSessionToConnection(reusableSession, ws);
+          session = reusableSession;
+        } else {
+          const spawned = spawnAppServerSession(connectionId);
+          attachSessionToConnection(spawned, ws);
+          session = spawned;
+        }
+      }
+
+      const appServer = session.child;
+      if (appServer.exitCode !== null || appServer.killed || !appServer.stdin) {
         logProxy(`conn=${connectionId} dropping client message because app-server is unavailable`);
         return;
       }
+
+      if (parsed && typeof parsed.id === 'number' && typeof parsed.method !== 'string') {
+        const target = session.pendingServerRequestTargets.get(parsed.id);
+        if (target === connectionId) {
+          session.pendingServerRequestTargets.delete(parsed.id);
+          ws.data.clientMessageCount += 1;
+          tapRpcFrame('client->app-server', payload);
+          appServer.stdin.write(payload.endsWith('\n') ? payload : `${payload}\n`);
+        }
+        return;
+      }
+
+      if (parsed && typeof parsed.id === 'number' && typeof parsed.method === 'string') {
+        const upstreamId = session.nextUpstreamRequestId;
+        session.nextUpstreamRequestId += 1;
+        session.pendingClientRequests.set(upstreamId, {
+          connectionId,
+          clientRequestId: parsed.id,
+          method: parsed.method,
+        });
+
+        if (parsed.method === 'turn/start') {
+          session.turnInProgress = true;
+        }
+        if (threadIdHint) {
+          bindThreadToSession(threadIdHint, session);
+        }
+
+        const outbound = JSON.stringify({ ...parsed, id: upstreamId });
+        session.lastRequesterConnectionId = connectionId;
+        ws.data.clientMessageCount += 1;
+        tapRpcFrame('client->app-server', outbound);
+        appServer.stdin.write(outbound.endsWith('\n') ? outbound : `${outbound}\n`);
+        return;
+      }
+
+      if (threadIdHint) {
+        bindThreadToSession(threadIdHint, session);
+      }
+      session.lastRequesterConnectionId = connectionId;
       ws.data.clientMessageCount += 1;
-      const payload = normalizeRpcPayload(message as any);
       tapRpcFrame('client->app-server', payload);
       appServer.stdin.write(payload.endsWith('\n') ? payload : `${payload}\n`);
     },
@@ -450,12 +742,33 @@ const server = Bun.serve<WsProxyData>({
       logProxy(
         `conn=${connectionId} client websocket closed stats(client->app-server=${ws.data.clientMessageCount}, app-server->client=${ws.data.appServerMessageCount})`,
       );
-      const appServer = ws.data.appServer;
-      ws.data.appServer = null;
-      if (appServer) {
-        void stopChildGracefully(appServer);
+      activeWsConnections.delete(connectionId);
+      const session = sessionForConnection(ws);
+      if (session) {
+        session.attachedConnectionIds.delete(connectionId);
+        for (const [requestId, targetConnectionId] of session.pendingServerRequestTargets) {
+          if (targetConnectionId === connectionId) {
+            session.pendingServerRequestTargets.delete(requestId);
+          }
+        }
+        for (const [requestId, route] of session.pendingClientRequests) {
+          if (route.connectionId === connectionId) {
+            session.pendingClientRequests.delete(requestId);
+          }
+        }
       }
-      ws.data.stdoutBuffer = '';
+      if (session && session.attachedConnectionIds.size === 0) {
+        if (session.turnInProgress) {
+          session.shutdownAfterTurnComplete = true;
+          if (!reusableAppServerSessionIds.includes(session.id)) {
+            reusableAppServerSessionIds.push(session.id);
+          }
+          logProxy(`conn=${connectionId} detached from session=${session.id}; waiting for turn/completed`);
+        } else {
+          void stopChildGracefully(session.child);
+        }
+      }
+      ws.data.appServerId = null;
     },
   },
 });
@@ -481,6 +794,7 @@ async function shutdown(signal: NodeJS.Signals) {
 
   server.stop(true);
   await stopAppServerGracefully();
+  await rm(eventsTmpRoot, { recursive: true, force: true });
   process.exit(0);
 }
 
@@ -504,4 +818,5 @@ process.once('exit', () => {
       child.kill('SIGKILL');
     }
   }
+  void rm(eventsTmpRoot, { recursive: true, force: true });
 });
