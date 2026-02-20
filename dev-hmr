@@ -14,6 +14,9 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
+# Ensure embedded web assets exist for the Go server root (:3275).
+npm --prefix clients/web run build
+
 cleanup() {
   set +e
   if [[ -n "${GO_PID:-}" ]]; then kill "$GO_PID" 2>/dev/null; fi
@@ -28,4 +31,14 @@ GO_PID=$!
 npm --prefix clients/web run dev -- --host 127.0.0.1 --port 5173 &
 WEB_PID=$!
 
-wait -n "$GO_PID" "$WEB_PID"
+while true; do
+  if ! kill -0 "$GO_PID" 2>/dev/null; then
+    wait "$GO_PID" || true
+    break
+  fi
+  if ! kill -0 "$WEB_PID" 2>/dev/null; then
+    wait "$WEB_PID" || true
+    break
+  fi
+  sleep 1
+done

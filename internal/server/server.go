@@ -63,6 +63,12 @@ type pendingInteraction struct {
 	params    any
 }
 
+type threadSummary struct {
+	ID        string `json:"id"`
+	Cwd       string `json:"cwd"`
+	UpdatedAt int64  `json:"updatedAt"`
+}
+
 type Server struct {
 	cfg config.Config
 
@@ -75,6 +81,8 @@ type Server struct {
 	threadToSession  map[string]int
 	nextSessionID    int
 	pendingResponses map[string]map[string]pendingInteraction
+	threadsMu        sync.RWMutex
+	knownThreads     map[string]threadSummary
 
 	sseMu          sync.Mutex
 	sseSubs        map[string]map[int]chan string
@@ -95,6 +103,7 @@ func New(cfg config.Config, eventStore *events.Store) *Server {
 		sessions:            map[int]*session{},
 		threadToSession:     map[string]int{},
 		pendingResponses:    map[string]map[string]pendingInteraction{},
+		knownThreads:        map[string]threadSummary{},
 		sseSubs:             map[string]map[int]chan string{},
 		sseNextEventID:      map[string]int{},
 		sessionIdleTTL:      5 * time.Minute,

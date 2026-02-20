@@ -90,6 +90,44 @@ function statusFromTurnStatus(status: ThreadReadTurn['status']): SessionStatus {
   return 'idle';
 }
 
+function toNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function normalizeThreadListEntry(raw: any): ThreadListEntry | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const id = typeof raw.id === 'string' ? raw.id : typeof raw.threadId === 'string' ? raw.threadId : '';
+  if (!id) {
+    return null;
+  }
+  const cwd = typeof raw.cwd === 'string' ? raw.cwd : typeof raw.path === 'string' ? raw.path : '';
+  const updatedAt =
+    toNumber(raw.updatedAt) ?? toNumber(raw.updated_at) ?? toNumber(raw.lastUpdatedAt) ?? toNumber(raw.timestamp) ?? Math.floor(Date.now() / 1000);
+  return { id, cwd, updatedAt };
+}
+
+function extractThreadList(result: any): ThreadListEntry[] {
+  const candidates = [result?.data, result?.threads, result?.conversations, result?.items];
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate)) {
+      continue;
+    }
+    return candidate.map(normalizeThreadListEntry).filter((entry): entry is ThreadListEntry => entry !== null);
+  }
+  return [];
+}
+
 function defaultAnswerForQuestion(question: UserInputQuestion): string {
   return question.options.length > 0 ? question.options[0] : '';
 }
@@ -778,13 +816,14 @@ function App() {
 
   async function refreshSessions() {
     try {
-      const result = await rpcPost<{ data: ThreadListEntry[] }>('thread/list', {
+      const result = await rpcPost<any>('thread/list', {
         limit: 50,
         archived: false,
       });
+      const listedSessions = extractThreadList(result);
 
       setSessions((current) =>
-        (result.data ?? [])
+        (listedSessions.length > 0 ? listedSessions : current)
           .map((thread) => {
             const existing = current.find((item) => item.id === thread.id);
             return {
@@ -866,6 +905,27 @@ function App() {
     }
   }
 
+  function selectSessionSummary(threadId: string) {
+    const summary = sessions.find((item) => item.id === threadId);
+    if (!summary) {
+      return;
+    }
+    setSession({
+      id: summary.id,
+      cwd: summary.cwd,
+      status: summary.status,
+      updatedAt: summary.updatedAt,
+      threadId: summary.id,
+      currentTurnId: null,
+      latestEventSeq: 0,
+      progress: {
+        completedItems: 0,
+        lastEventType: null,
+      },
+      events: [],
+    });
+  }
+
   async function submitPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!session || !prompt.trim()) {
@@ -933,6 +993,7 @@ function App() {
                 value={activeSessionId}
                 onChange={(nextSessionId) => {
                   if (nextSessionId) {
+                    selectSessionSummary(nextSessionId);
                     void resumeSession(nextSessionId);
                   }
                 }}

@@ -3,7 +3,8 @@ tmp_dir = ".tmp/air"
 
 [build]
   cmd = "mkdir -p .tmp/go-cache .tmp/go-tmp .tmp/bin && npm --prefix clients/web run build && GOCACHE=$(pwd)/.tmp/go-cache GOTMPDIR=$(pwd)/.tmp/go-tmp go build -o ./.tmp/bin/darkhold-go ./cmd/darkhold"
-  bin = "./.tmp/bin/darkhold-go --bind 127.0.0.1 --port 3275"
+  bin = "./.tmp/bin/darkhold-go"
+  full_bin = "./.tmp/bin/darkhold-go --bind 0.0.0.0 --port 3275 --allow-cidr 100.64.0.0/10"
   delay = 250
   stop_on_error = true
   include_dir = ["cmd", "internal", "clients/web"]
@@ -22,3 +23,7 @@ tmp_dir = ".tmp/air"
 
 [misc]
   clean_on_exit = false
+
+[screen]
+  clear_on_rebuild = false
+  keep_scroll = true

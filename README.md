@@ -44,7 +44,8 @@ Darkhold server startup accepts:
 
 Default behavior:
 
-- Go server binds to `127.0.0.1:3275` in provided dev scripts.
+- Go server binds to `0.0.0.0:3275` in provided dev scripts.
+- Dev scripts set `--allow-cidr 100.64.0.0/10` by default (plus localhost and Tailscale ULA IPv6).
 - Vite dev server binds to `127.0.0.1:5173` and proxies `/api` to `127.0.0.1:3275`.
 
 ## Build

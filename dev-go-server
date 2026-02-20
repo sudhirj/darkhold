@@ -6,8 +6,9 @@ cd "$ROOT_DIR"
 
 mkdir -p .tmp/go-cache .tmp/go-tmp .tmp/bin
 
-: "${BIND:=127.0.0.1}"
+: "${BIND:=0.0.0.0}"
 : "${PORT:=3275}"
+: "${ALLOW_CIDR:=100.64.0.0/10}"
 
 BIN_PATH=".tmp/bin/darkhold-go"
 LOG_PATH=".tmp/go-server.log"
@@ -24,4 +25,5 @@ echo "Starting Go server on http://${BIND}:${PORT}"
 "$BIN_PATH" \
   --bind "$BIND" \
   --port "$PORT" \
+  --allow-cidr "$ALLOW_CIDR" \
   "$@" 2>&1 | tee "$LOG_PATH"
