@@ -382,4 +382,45 @@ describe('rpc proxy integration', () => {
     },
     25_000,
   );
+
+  it(
+    'allows turn/start from either client when multiple clients share a thread',
+    async () => {
+      if (!(await canUseLoopbackSockets())) {
+        return;
+      }
+      const instance = await startIntegrationServer();
+      servers.push(instance);
+
+      const ws1 = new RpcWsClient(`ws://127.0.0.1:${instance.httpPort}/api/rpc/ws`);
+      await ws1.waitOpen();
+      await ws1.request('initialize', { clientInfo: { name: 'it1', title: 'it1', version: '0.0.0' }, capabilities: { experimentalApi: true } });
+      const started = await ws1.request<{ thread: { id: string } }>('thread/start', { cwd: instance.tempRoot });
+
+      const ws2 = new RpcWsClient(
+        `ws://127.0.0.1:${instance.httpPort}/api/rpc/ws?threadId=${encodeURIComponent(started.thread.id)}`,
+      );
+      await ws2.waitOpen();
+      await ws2.request('initialize', { clientInfo: { name: 'it2', title: 'it2', version: '0.0.0' }, capabilities: { experimentalApi: true } });
+      await ws2.request('thread/resume', { threadId: started.thread.id });
+
+      const startFromWs1 = await ws1.request<{ ok: boolean }>('turn/start', {
+        threadId: started.thread.id,
+        input: [{ type: 'text', text: 'started by ws1' }],
+      });
+      expect(startFromWs1.ok).toBe(true);
+      await ws1.waitForNotification((m) => m.method === 'turn/completed' && m.params?.threadId === started.thread.id);
+
+      const startFromWs2 = await ws2.request<{ ok: boolean }>('turn/start', {
+        threadId: started.thread.id,
+        input: [{ type: 'text', text: 'started by ws2' }],
+      });
+      expect(startFromWs2.ok).toBe(true);
+      await ws2.waitForNotification((m) => m.method === 'turn/completed' && m.params?.threadId === started.thread.id);
+
+      ws1.close();
+      ws2.close();
+    },
+    25_000,
+  );
 });
