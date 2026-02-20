@@ -306,6 +306,8 @@ const activeAppServerChildren = new Set<ChildProcess>();
 const appServerSessions = new Map<number, AppServerSession>();
 const reusableAppServerSessionIds: number[] = [];
 const threadToSessionId = new Map<string, number>();
+const threadToConnectionIds = new Map<string, Set<number>>();
+const connectionToThreadIds = new Map<number, Set<string>>();
 
 function sessionForConnection(ws: ServerWebSocketLike): AppServerSession | null {
   if (ws.data.appServerId === null) {
@@ -331,6 +333,40 @@ function bindThreadToSession(threadId: string, session: AppServerSession) {
   session.knownThreadIds.add(threadId);
 }
 
+function bindConnectionToThread(connectionId: number, threadId: string) {
+  let connectionsForThread = threadToConnectionIds.get(threadId);
+  if (!connectionsForThread) {
+    connectionsForThread = new Set<number>();
+    threadToConnectionIds.set(threadId, connectionsForThread);
+  }
+  connectionsForThread.add(connectionId);
+
+  let threadsForConnection = connectionToThreadIds.get(connectionId);
+  if (!threadsForConnection) {
+    threadsForConnection = new Set<string>();
+    connectionToThreadIds.set(connectionId, threadsForConnection);
+  }
+  threadsForConnection.add(threadId);
+}
+
+function unbindConnectionFromAllThreads(connectionId: number) {
+  const threadsForConnection = connectionToThreadIds.get(connectionId);
+  if (!threadsForConnection) {
+    return;
+  }
+  for (const threadId of threadsForConnection) {
+    const connectionsForThread = threadToConnectionIds.get(threadId);
+    if (!connectionsForThread) {
+      continue;
+    }
+    connectionsForThread.delete(connectionId);
+    if (connectionsForThread.size === 0) {
+      threadToConnectionIds.delete(threadId);
+    }
+  }
+  connectionToThreadIds.delete(connectionId);
+}
+
 function sendToConnection(connectionId: number, payload: string, direction: 'app-server->client' | 'client->app-server' = 'app-server->client') {
   const ws = activeWsConnections.get(connectionId);
   if (!ws || ws.readyState !== 1) {
@@ -343,6 +379,35 @@ function sendToConnection(connectionId: number, payload: string, direction: 'app
   }
   ws.send(payload);
   return true;
+}
+
+function sendToThreadConnections(threadId: string, payload: string): boolean {
+  const connectionsForThread = threadToConnectionIds.get(threadId);
+  if (!connectionsForThread || connectionsForThread.size === 0) {
+    return false;
+  }
+
+  let deliveredAny = false;
+  for (const connectionId of Array.from(connectionsForThread)) {
+    const delivered = sendToConnection(connectionId, payload);
+    if (!delivered) {
+      connectionsForThread.delete(connectionId);
+      const threadsForConnection = connectionToThreadIds.get(connectionId);
+      if (threadsForConnection) {
+        threadsForConnection.delete(threadId);
+        if (threadsForConnection.size === 0) {
+          connectionToThreadIds.delete(connectionId);
+        }
+      }
+      continue;
+    }
+    deliveredAny = true;
+  }
+
+  if (connectionsForThread.size === 0) {
+    threadToConnectionIds.delete(threadId);
+  }
+  return deliveredAny;
 }
 
 function spawnAppServerSession(connectionId: number): AppServerSession {
@@ -398,6 +463,7 @@ function spawnAppServerSession(connectionId: number): AppServerSession {
               const threadId = parsed?.result?.thread?.id;
               if (typeof threadId === 'string') {
                 bindThreadToSession(threadId, session);
+                bindConnectionToThread(route.connectionId, threadId);
                 if ((route.method === 'thread/read' || route.method === 'thread/resume') && parsed?.result?.thread?.turns) {
                   void rehydrateThreadEventsFromRead(threadId, parsed.result);
                 }
@@ -425,9 +491,11 @@ function spawnAppServerSession(connectionId: number): AppServerSession {
 
         if (parsed && typeof parsed.method === 'string') {
           const threadId = parsed?.params?.threadId;
+          let deliveredViaThreadSubscription = false;
           if (typeof threadId === 'string') {
             bindThreadToSession(threadId, session);
             void appendThreadEvent(threadId, line);
+            deliveredViaThreadSubscription = sendToThreadConnections(threadId, line);
           }
           if (parsed.method === 'turn/started') {
             session.turnInProgress = true;
@@ -438,6 +506,10 @@ function spawnAppServerSession(connectionId: number): AppServerSession {
               logProxy(`session=${session.id} turn completed while detached, shutting down app-server`);
               void stopChildGracefully(session.child);
             }
+          }
+
+          if (deliveredViaThreadSubscription) {
+            continue;
           }
         }
 
@@ -622,6 +694,7 @@ const server = Bun.serve<WsProxyData>({
 
       logProxy(`conn=${connectionId} client websocket opened`);
       if (ws.data.desiredThreadId) {
+        bindConnectionToThread(connectionId, ws.data.desiredThreadId);
         const mappedSessionId = threadToSessionId.get(ws.data.desiredThreadId) ?? null;
         if (mappedSessionId !== null) {
           const mappedSession = appServerSessions.get(mappedSessionId) ?? null;
@@ -659,6 +732,9 @@ const server = Bun.serve<WsProxyData>({
       }
 
       const threadIdHint = typeof parsed?.params?.threadId === 'string' ? parsed.params.threadId : null;
+      if (threadIdHint) {
+        bindConnectionToThread(connectionId, threadIdHint);
+      }
       let session = sessionForConnection(ws);
       if (threadIdHint) {
         const mappedSessionId = threadToSessionId.get(threadIdHint) ?? null;
@@ -743,6 +819,7 @@ const server = Bun.serve<WsProxyData>({
         `conn=${connectionId} client websocket closed stats(client->app-server=${ws.data.clientMessageCount}, app-server->client=${ws.data.appServerMessageCount})`,
       );
       activeWsConnections.delete(connectionId);
+      unbindConnectionFromAllThreads(connectionId);
       const session = sessionForConnection(ws);
       if (session) {
         session.attachedConnectionIds.delete(connectionId);

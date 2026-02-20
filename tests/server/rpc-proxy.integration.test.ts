@@ -332,4 +332,54 @@ describe('rpc proxy integration', () => {
     },
     25_000,
   );
+
+  it(
+    'keeps broadcasting live thread events after one of multiple clients reconnects',
+    async () => {
+      if (!(await canUseLoopbackSockets())) {
+        return;
+      }
+      const instance = await startIntegrationServer();
+      servers.push(instance);
+
+      const ws1 = new RpcWsClient(`ws://127.0.0.1:${instance.httpPort}/api/rpc/ws`);
+      await ws1.waitOpen();
+      await ws1.request('initialize', { clientInfo: { name: 'it1', title: 'it1', version: '0.0.0' }, capabilities: { experimentalApi: true } });
+      const started = await ws1.request<{ thread: { id: string } }>('thread/start', { cwd: instance.tempRoot });
+
+      const ws2 = new RpcWsClient(
+        `ws://127.0.0.1:${instance.httpPort}/api/rpc/ws?threadId=${encodeURIComponent(started.thread.id)}`,
+      );
+      await ws2.waitOpen();
+      await ws2.request('initialize', { clientInfo: { name: 'it2', title: 'it2', version: '0.0.0' }, capabilities: { experimentalApi: true } });
+      await ws2.request('thread/resume', { threadId: started.thread.id });
+      ws2.close();
+
+      const ws2Reconnected = new RpcWsClient(
+        `ws://127.0.0.1:${instance.httpPort}/api/rpc/ws?threadId=${encodeURIComponent(started.thread.id)}`,
+      );
+      await ws2Reconnected.waitOpen();
+      await ws2Reconnected.request('initialize', {
+        clientInfo: { name: 'it2-reconnected', title: 'it2-reconnected', version: '0.0.0' },
+        capabilities: { experimentalApi: true },
+      });
+      await ws2Reconnected.request('thread/resume', { threadId: started.thread.id });
+
+      await ws1.request('turn/start', { threadId: started.thread.id, input: [{ type: 'text', text: 'hello after reconnect' }] });
+
+      const n1 = await ws1.waitForNotification(
+        (m) => m.method === 'item/agentMessage/delta' && m.params?.threadId === started.thread.id,
+      );
+      const n2 = await ws2Reconnected.waitForNotification(
+        (m) => m.method === 'item/agentMessage/delta' && m.params?.threadId === started.thread.id,
+      );
+
+      expect(String(n1.params?.delta)).toContain('delta-from-');
+      expect(String(n2.params?.delta)).toContain('delta-from-');
+
+      ws1.close();
+      ws2Reconnected.close();
+    },
+    25_000,
+  );
 });
