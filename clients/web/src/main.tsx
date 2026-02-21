@@ -324,6 +324,7 @@ function App() {
   const [isSentinelInView, setIsSentinelInView] = useState(false);
   const [promptDockHeightPx, setPromptDockHeightPx] = useState(0);
   const [isDebugPanelOpen, setIsDebugPanelOpen] = useState(false);
+  const [assistantTypingText, setAssistantTypingText] = useState('');
   const conversationEndRef = useRef<HTMLDivElement | null>(null);
   const promptDockRef = useRef<HTMLFormElement | null>(null);
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -356,15 +357,6 @@ function App() {
         : [],
     [session?.currentTurnId, session?.events],
   );
-  const assistantTypingText = useMemo(
-    () =>
-      thinkingEvents
-        .filter((event) => event.type === 'agent.delta')
-        .map((event) => event.message)
-        .join(''),
-    [thinkingEvents],
-  );
-
   const isLiveWorkActive = session?.status === 'running' && session?.currentTurnId !== null;
 
   useEffect(() => {
@@ -754,6 +746,7 @@ function App() {
       const turnId = extractTurnId(payload) ?? `live-turn:${payload.threadId}:${Date.now()}`;
       setThreadCurrentTurn(payload.threadId, turnId);
       setThreadStatus(payload.threadId, 'running');
+      setAssistantTypingText('');
       return;
     }
 
@@ -769,6 +762,7 @@ function App() {
       if (nextStatus === 'error' && payload.turn?.error?.message) {
         pushEventToSession(payload.threadId, 'turn.error', payload.turn.error.message, eventTurnId);
       }
+      setAssistantTypingText('');
       void refreshSessions();
       return;
     }
@@ -784,6 +778,9 @@ function App() {
       if (!summary) {
         return;
       }
+      if (summary.type === 'assistant.output') {
+        setAssistantTypingText('');
+      }
       pushEventToSession(payload.threadId, summary.type, summary.message, extractTurnId(payload));
       return;
     }
@@ -792,6 +789,7 @@ function App() {
       if (payload.threadId !== activeThreadIdRef.current) {
         return;
       }
+      setAssistantTypingText((current) => current + payload.delta);
       pushEventToSession(payload.threadId, 'agent.delta', payload.delta, extractTurnId(payload));
       return;
     }

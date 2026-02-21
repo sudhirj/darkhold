@@ -103,7 +103,7 @@ export function AgentThreadPanel({
             ))}
             {assistantTypingText.trim().length > 0 ? (
               <li className="list-group-item border-0 bg-transparent p-0 mb-2">
-                <div className="turn-event-group rounded-3 border overflow-hidden">
+                <div className="turn-event-group typing-preview-box rounded-3 border overflow-hidden">
                   <div className="ps-2 py-2 list-group-item-light">
                     <div className="d-flex align-items-baseline">
                       <div className="flex-shrink-0 me-2">
@@ -112,7 +112,7 @@ export function AgentThreadPanel({
                           style={{ width: '1.75rem', height: '1.75rem' }}
                           aria-hidden="true"
                         >
-                          <i className="bi bi-robot" style={{ opacity: 0.6 }} />
+                          <i className="bi bi-robot typing-preview-icon" />
                         </span>
                       </div>
                       <div className="flex-grow-1">
