@@ -1,15 +1,14 @@
-import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Dialog, DialogBackdrop, DialogPanel, DialogTitle, Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
 import 'bootstrap/dist/css/bootstrap.min.css';
 import 'bootstrap-icons/font/bootstrap-icons.css';
 import '@ibm/plex/css/ibm-plex.css';
 import './styles.css';
-import { jsonFetch } from './api';
+import { jsonFetch, rpcPost, isThreadNotFoundError } from './api';
 import { FolderBrowserDialog } from './components/folder-browser-dialog';
 import { AgentThreadPanel } from './components/agent-thread-panel';
-import { isConversationEvent, isTransientProgressEvent } from './thread-utils';
-import { AgentEvent, FolderEntry, FolderListing, ThreadState, ThreadSummary } from './types';
+import { AgentEvent, FolderListing, ThreadState, ThreadSummary } from './types';
 
 type JsonRpcRequest = {
   id: number;
@@ -120,11 +119,6 @@ function extractThreadList(result: any): ThreadListEntry[] {
 
 function defaultAnswerForQuestion(question: UserInputQuestion): string {
   return question.options.length > 0 ? question.options[0] : '';
-}
-
-function isThreadNotFoundError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.toLowerCase().includes('thread not found');
 }
 
 function readThreadIdFromUrl(): string | null {
@@ -326,14 +320,6 @@ async function loadThreadEvents(threadId: string): Promise<string[]> {
   }
 }
 
-async function rpcPost<T = unknown>(method: string, params?: unknown): Promise<T> {
-  return await jsonFetch<T>('/api/rpc', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ method, params }),
-  });
-}
-
 function App() {
   const [folderCache, setFolderCache] = useState<Record<string, FolderListing>>({});
   const [columnPaths, setColumnPaths] = useState<string[]>([]);
@@ -343,36 +329,18 @@ function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [thread, setThread] = useState<ThreadState | null>(null);
   const [isFolderBrowserOpen, setIsFolderBrowserOpen] = useState(false);
-  const [prompt, setPrompt] = useState('');
   const [activeUiRequest, setActiveUiRequest] = useState<PendingUiRequest | null>(null);
   const [uiAnswers, setUiAnswers] = useState<Record<string, string>>({});
-  const [isSentinelInView, setIsSentinelInView] = useState(false);
-  const [promptDockHeightPx, setPromptDockHeightPx] = useState(0);
   const [isDebugPanelOpen, setIsDebugPanelOpen] = useState(false);
-  const [assistantTypingText, setAssistantTypingText] = useState('');
-  const conversationEndRef = useRef<HTMLDivElement | null>(null);
-  const promptDockRef = useRef<HTMLFormElement | null>(null);
-  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const folderInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const suppressNextAutoFocusRef = useRef(false);
   const [pendingFocusPath, setPendingFocusPath] = useState<string | null>(null);
-  const threadEventsSourceRef = useRef<EventSource | null>(null);
-  const threadEventsSourceThreadIdRef = useRef<string | null>(null);
-  const activeThreadIdRef = useRef<string | null>(null);
   const queuedUiRequestsRef = useRef<PendingUiRequest[]>([]);
-  const shouldStickToBottomRef = useRef(true);
 
   const basePath = columnPaths.length > 0 ? (folderCache[columnPaths[0]]?.root ?? null) : null;
 
-  const conversationEvents = useMemo(
-    () => (thread?.events ?? []).filter((event) => isConversationEvent(event)),
-    [thread?.events],
-  );
-  const thinkingEvents = useMemo(() => (thread?.events ?? []).filter((event) => isTransientProgressEvent(event)), [thread?.events]);
   const activeThreadId = thread?.threadId ?? null;
   const selectorLabel = thread ? `${thread.id.slice(0, 8)} · ${thread.cwd}` : 'Select a thread';
-  const isLiveWorkActive = assistantTypingText.trim().length > 0;
-  const [isThinkingDialogOpen, setIsThinkingDialogOpen] = useState(false);
 
   useEffect(() => {
     void initializeFolderBrowser();
@@ -401,79 +369,10 @@ function App() {
     return () => {
       window.removeEventListener('offline', onOffline);
       window.removeEventListener('online', onOnline);
-      threadEventsSourceRef.current?.close();
-      threadEventsSourceRef.current = null;
-      threadEventsSourceThreadIdRef.current = null;
     };
   }, []);
 
-  useEffect(() => {
-    const promptDock = promptDockRef.current;
-    if (!promptDock) {
-      return;
-    }
-
-    const rootStyle = document.documentElement.style;
-    const updatePromptDockHeight = () => {
-      const measuredHeight = promptDock.getBoundingClientRect().height;
-      rootStyle.setProperty('--prompt-dock-height', `${measuredHeight}px`);
-      setPromptDockHeightPx(measuredHeight);
-    };
-
-    updatePromptDockHeight();
-
-    if (typeof ResizeObserver === 'undefined') {
-      window.addEventListener('resize', updatePromptDockHeight);
-      return () => {
-        window.removeEventListener('resize', updatePromptDockHeight);
-      };
-    }
-
-    const observer = new ResizeObserver(() => {
-      updatePromptDockHeight();
-    });
-    observer.observe(promptDock);
-    return () => {
-      observer.disconnect();
-    };
-  }, [thread?.id]);
-
-  useEffect(() => {
-    if (!thread) {
-      shouldStickToBottomRef.current = true;
-      setIsSentinelInView(false);
-      return;
-    }
-    const sentinel = conversationEndRef.current;
-    if (!sentinel || typeof IntersectionObserver === 'undefined') {
-      return;
-    }
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const isInView = entries.some((entry) => entry.isIntersecting);
-        shouldStickToBottomRef.current = isInView;
-        setIsSentinelInView(isInView);
-      },
-      {
-        threshold: 0.9,
-      },
-    );
-    observer.observe(sentinel);
-    return () => {
-      observer.disconnect();
-    };
-  }, [thread?.id]);
-
-  useEffect(() => {
-    if (!thread) {
-      return;
-    }
-    requestAnimationFrame(() => {
-      conversationEndRef.current?.scrollIntoView({ block: 'end', inline: 'nearest' });
-    });
-  }, [thread?.id, thread?.latestEventSeq]);
-
+  // Debug panel toggle (Ctrl/Cmd+Shift+D).
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'd') {
@@ -487,60 +386,6 @@ function App() {
       window.removeEventListener('keydown', onKeyDown);
     };
   }, []);
-
-  useEffect(() => {
-    activeThreadIdRef.current = thread?.threadId ?? null;
-  }, [thread?.threadId]);
-
-  useEffect(() => {
-    const threadId = thread?.threadId ?? null;
-    if (!threadId) {
-      threadEventsSourceRef.current?.close();
-      threadEventsSourceRef.current = null;
-      threadEventsSourceThreadIdRef.current = null;
-      return;
-    }
-    if (threadEventsSourceRef.current && threadEventsSourceThreadIdRef.current === threadId) {
-      return;
-    }
-
-    threadEventsSourceRef.current?.close();
-    const source = new EventSource(`/api/thread/events/stream?threadId=${encodeURIComponent(threadId)}`);
-    source.onmessage = (event) => {
-      let parsed: { method?: string; params?: unknown };
-      try {
-        parsed = JSON.parse(event.data) as { method?: string; params?: unknown };
-      } catch {
-        return;
-      }
-      if (typeof parsed.method !== 'string') {
-        return;
-      }
-      handleNotification(parsed.method, parsed.params);
-    };
-    source.onerror = () => {
-      // Browser will reconnect automatically and resume from Last-Event-ID.
-    };
-    threadEventsSourceRef.current = source;
-    threadEventsSourceThreadIdRef.current = threadId;
-
-    return () => {
-      source.close();
-      if (threadEventsSourceRef.current === source) {
-        threadEventsSourceRef.current = null;
-      }
-      if (threadEventsSourceThreadIdRef.current === threadId) {
-        threadEventsSourceThreadIdRef.current = null;
-      }
-    };
-  }, [thread?.threadId]);
-
-  useEffect(() => {
-    if (!thread) {
-      return;
-    }
-    promptInputRef.current?.focus();
-  }, [thread?.id]);
 
   useEffect(() => {
     if (!pendingFocusPath) {
@@ -564,32 +409,6 @@ function App() {
     }
     setUiAnswers(defaults);
   }, [activeUiRequest]);
-
-  function directoriesFor(listingPath: string): FolderEntry[] {
-    const listing = folderCache[listingPath];
-    if (!listing) {
-      return [];
-    }
-    return listing.entries.filter((entry) => entry.kind === 'directory');
-  }
-
-  function pushEventToThread(threadId: string, type: string, message: string, turnId: string | null = null) {
-    setThread((current) => {
-      if (!current || current.threadId !== threadId) {
-        return current;
-      }
-
-      const seq = current.latestEventSeq + 1;
-      const nextEventsWithTurn = [...current.events, { seq, timestamp: nowIso(), type, message, turnId }];
-
-      return {
-        ...current,
-        latestEventSeq: seq,
-        updatedAt: nowIso(),
-        events: nextEventsWithTurn,
-      };
-    });
-  }
 
   function enqueueUiRequest(request: PendingUiRequestDraft): Promise<unknown> {
     return new Promise((resolve) => {
@@ -709,55 +528,6 @@ function App() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ threadId, requestId, error: { message } }),
       }).catch(() => {});
-    }
-  }
-
-  function handleNotification(method: string, params: unknown) {
-    const payload = (params ?? {}) as any;
-
-    if (method === 'darkhold/interaction/request') {
-      void handleThreadInteractionRequest(payload);
-      return;
-    }
-
-    if (method === 'turn/completed' && typeof payload.threadId === 'string') {
-      const turnStatus = typeof payload.turn?.status === 'string' ? payload.turn.status : '';
-      if (turnStatus === 'failed' && payload.turn?.error?.message) {
-        pushEventToThread(payload.threadId, 'turn.error', payload.turn.error.message, extractTurnId(payload));
-      }
-      void refreshThreads();
-      return;
-    }
-
-    if ((method === 'item/started' || method === 'item/completed') && payload.item) {
-      if (payload.threadId !== activeThreadIdRef.current) {
-        return;
-      }
-      if (method === 'item/started' && payload.item?.type === 'userMessage') {
-        return;
-      }
-      const summary = summarizeThreadItem(payload.item);
-      if (!summary) {
-        return;
-      }
-      if (summary.type === 'assistant.output') {
-        setAssistantTypingText('');
-      }
-      pushEventToThread(payload.threadId, summary.type, summary.message, extractTurnId(payload));
-      return;
-    }
-
-    if (method === 'item/agentMessage/delta' && typeof payload.delta === 'string') {
-      if (payload.threadId !== activeThreadIdRef.current) {
-        return;
-      }
-      setAssistantTypingText((current) => current + payload.delta);
-      pushEventToThread(payload.threadId, 'agent.delta', payload.delta, extractTurnId(payload));
-      return;
-    }
-
-    if (method === 'error' && payload?.message) {
-      setError(String(payload.message));
     }
   }
 
@@ -929,55 +699,6 @@ function App() {
     });
   }
 
-  async function submitPrompt(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!thread || !prompt.trim()) {
-      return;
-    }
-
-    const input = prompt.trim();
-
-    try {
-      setError(null);
-      setPrompt('');
-
-      const turnParams = {
-        threadId: thread.threadId,
-        input: [
-          {
-            type: 'text',
-            text: input,
-            text_elements: [],
-          },
-        ],
-      };
-
-      try {
-        await rpcPost('turn/start', turnParams);
-      } catch (error: unknown) {
-        if (!isThreadNotFoundError(error)) {
-          throw error;
-        }
-        await rpcPost('thread/resume', { threadId: thread.threadId });
-        await rpcPost('turn/start', turnParams);
-      }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      setError(message);
-      pushEventToThread(thread.threadId, 'turn.error', message);
-    }
-  }
-
-  function handlePromptKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === 'Enter' && !event.shiftKey) {
-      event.preventDefault();
-      if (!thread || !prompt.trim()) {
-        return;
-      }
-      event.currentTarget.form?.requestSubmit();
-    }
-  }
-
   function openFolderBrowser() {
     setPendingFocusPath(null);
     void initializeFolderBrowser();
@@ -1075,37 +796,14 @@ function App() {
         {error ? <div className="alert alert-danger">{error}</div> : null}
         <AgentThreadPanel
           thread={thread}
-          conversationEvents={conversationEvents}
-          assistantTypingText={assistantTypingText}
-          conversationEndRef={conversationEndRef}
-          promptDockRef={promptDockRef}
-          promptInputRef={promptInputRef}
-          prompt={prompt}
-          onSubmitPrompt={submitPrompt}
-          onPromptKeyDown={handlePromptKeyDown}
-          onPromptChange={setPrompt}
+          onError={(message) => setError(message)}
+          onTurnCompleted={() => void refreshThreads()}
+          onInteractionRequest={(payload) => void handleThreadInteractionRequest(payload)}
+          showDebug={isDebugPanelOpen}
         />
       </main>
 
-      {thread ? (
-        <button
-          type="button"
-          className={`btn btn-light border shadow-sm thinking-fab d-inline-flex align-items-center gap-2 ${
-            isLiveWorkActive ? 'is-active' : ''
-          }`}
-          onClick={() => setIsThinkingDialogOpen(true)}
-          aria-label="Show thinking events"
-          title="Show thinking events"
-        >
-          <span
-            className={`spinner-border spinner-border-sm ${isLiveWorkActive ? 'text-primary' : 'text-secondary'}`}
-            aria-hidden="true"
-          />
-          <span className="small fw-semibold">{thinkingEvents.length}</span>
-        </button>
-      ) : null}
-
-      <div className="position-fixed top-0 end-0 mt-5 me-3 d-flex flex-column align-items-end gap-2" style={{ zIndex: 1055 }}>
+      <div className="position-fixed top-0 end-0 mt-5 me-3" style={{ zIndex: 1055 }}>
         <button
           type="button"
           className="btn btn-sm btn-light border shadow-sm d-inline-flex align-items-center gap-2 font-mono"
@@ -1116,63 +814,7 @@ function App() {
           <i className={`bi ${isDebugPanelOpen ? 'bi-bug-fill' : 'bi-bug'}`} aria-hidden="true" />
           <span>Debug</span>
         </button>
-
-        {isDebugPanelOpen ? (
-          <aside
-            className="p-2 border rounded bg-light shadow-sm font-mono small"
-            style={{ minWidth: '220px', opacity: 0.95 }}
-            aria-label="Scroll debug panel"
-          >
-            <div className="d-flex align-items-center justify-content-between gap-2 mb-1">
-              <div className="fw-semibold">Debug</div>
-              <button
-                type="button"
-                className="btn btn-sm btn-outline-secondary py-0 px-1"
-                onClick={() => setIsDebugPanelOpen(false)}
-                aria-label="Close debug panel"
-                title="Close debug panel"
-              >
-                <i className="bi bi-x-lg" aria-hidden="true" />
-              </button>
-            </div>
-            <div>sentinelInView: {isSentinelInView ? 'yes' : 'no'}</div>
-            <div>promptDockHeight: {Math.round(promptDockHeightPx)}px</div>
-            <div>liveActive: {isLiveWorkActive ? 'yes' : 'no'}</div>
-            <div className="text-secondary mt-1">Shortcut: Ctrl/Cmd+Shift+D</div>
-          </aside>
-        ) : null}
       </div>
-
-      {isThinkingDialogOpen ? (
-        <Dialog open onClose={() => setIsThinkingDialogOpen(false)} className="position-relative">
-          <DialogBackdrop className="modal-backdrop fade show" />
-          <div className="modal fade show d-block position-fixed top-0 start-0 w-100 h-100" tabIndex={-1}>
-            <div className="modal-dialog modal-dialog-scrollable modal-lg modal-dialog-centered">
-              <DialogPanel className="modal-content">
-                <div className="modal-header">
-                  <DialogTitle as="h2" className="modal-title h5 mb-0">
-                    Thinking Events
-                  </DialogTitle>
-                  <button type="button" className="btn-close" aria-label="Close" onClick={() => setIsThinkingDialogOpen(false)} />
-                </div>
-                <div className="modal-body">
-                  {thinkingEvents.length === 0 ? <p className="text-secondary mb-0">No thinking events yet.</p> : null}
-                  {thinkingEvents.length > 0 ? (
-                    <ul className="list-group">
-                      {thinkingEvents.map((event) => (
-                        <li key={event.seq} className="list-group-item">
-                          <div className="small font-mono text-secondary mb-1">{event.type}</div>
-                          <pre className="mb-0 chat-text">{event.message}</pre>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : null}
-                </div>
-              </DialogPanel>
-            </div>
-          </div>
-        </Dialog>
-      ) : null}
 
       {activeUiRequest ? (
         <Dialog open onClose={handleUiRequestClose} className="position-relative">
