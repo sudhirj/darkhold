@@ -39,8 +39,15 @@ func (s *Store) lockPath(threadID string) string {
 	return filepath.Join(s.RootDir, safe+".lock")
 }
 
+const (
+	lockStaleDuration = 30 * time.Second
+	lockTimeout       = 10 * time.Second
+	lockPollInterval  = 8 * time.Millisecond
+)
+
 func (s *Store) withThreadFileLock(threadID string, fn func() error) error {
 	lock := s.lockPath(threadID)
+	deadline := time.Now().Add(lockTimeout)
 	for {
 		err := os.Mkdir(lock, 0o755)
 		if err == nil {
@@ -49,7 +56,17 @@ func (s *Store) withThreadFileLock(threadID string, fn func() error) error {
 		if !errors.Is(err, os.ErrExist) {
 			return err
 		}
-		time.Sleep(8 * time.Millisecond)
+		// Break stale locks left by crashed processes.
+		if info, statErr := os.Stat(lock); statErr == nil {
+			if time.Since(info.ModTime()) > lockStaleDuration {
+				_ = os.RemoveAll(lock)
+				continue
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out acquiring lock for thread %s", threadID)
+		}
+		time.Sleep(lockPollInterval)
 	}
 	defer func() {
 		_ = os.RemoveAll(lock)

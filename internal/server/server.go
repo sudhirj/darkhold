@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -44,8 +45,11 @@ type session struct {
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
 
-	upstreamInitialized atomic.Bool
-	nextRequestID       int64
+	initOnce      sync.Once
+	initErr       error
+	nextRequestID int64
+
+	writeMu sync.Mutex // guards stdin writes only; never hold mu during IO
 
 	mu             sync.Mutex
 	pending        map[int64]chan map[string]any
@@ -91,6 +95,9 @@ type Server struct {
 	sessionTimingMu     sync.RWMutex
 	sessionIdleTTL      time.Duration
 	sessionReapInterval time.Duration
+	rpcTimeout          time.Duration
+
+	maxRequestBodySize int64
 }
 
 type channelMessageWriter struct {
@@ -127,6 +134,8 @@ func New(cfg config.Config, eventStore *events.Store) *Server {
 		sseProvider:         provider,
 		sessionIdleTTL:      5 * time.Minute,
 		sessionReapInterval: 5 * time.Second,
+		rpcTimeout:          60 * time.Second,
+		maxRequestBodySize:  10 << 20, // 10 MB
 	}
 	go s.sessionIdleReaper()
 	return s
@@ -285,6 +294,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestBodySize)
 	var request struct {
 		Method string `json:"method"`
 		Params any    `json:"params"`
@@ -311,9 +321,6 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	if threadIDHint != "" {
-		s.bindThreadToSession(threadIDHint, sess)
-	}
 
 	if request.Method != "initialize" {
 		if err := s.ensureInitialized(sess); err != nil {
@@ -337,6 +344,10 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if threadIDHint != "" {
+		s.bindThreadToSession(threadIDHint, sess)
+	}
+
 	if request.Method == "thread/start" || request.Method == "thread/read" || request.Method == "thread/resume" {
 		if result, ok := response["result"].(map[string]any); ok {
 			if threadObj, ok := result["thread"].(map[string]any); ok {
@@ -358,6 +369,7 @@ func (s *Server) handleInteractionRespond(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestBodySize)
 	var request struct {
 		ThreadID  string `json:"threadId"`
 		RequestID string `json:"requestId"`
@@ -400,7 +412,7 @@ func (s *Server) handleInteractionRespond(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	payload := map[string]any{"id": pending.requestID}
+	payload := map[string]any{"jsonrpc": "2.0", "id": pending.requestID}
 	if request.Error != nil {
 		payload["error"] = request.Error
 	} else {
@@ -471,11 +483,14 @@ func (s *Server) publishThreadEvent(threadID, payload string) {
 
 	eventID, err := s.eventStore.Append(threadID, payload)
 	if err != nil {
+		log.Printf("[publish] failed to append event for thread %s: %v", threadID, err)
 		return
 	}
 	msg := &sse.Message{ID: sse.ID(eventID)}
 	msg.AppendData(payload)
-	_ = s.sseProvider.Publish(msg, []string{threadID})
+	if err := s.sseProvider.Publish(msg, []string{threadID}); err != nil {
+		log.Printf("[publish] failed to broadcast event for thread %s: %v", threadID, err)
+	}
 }
 
 func sendSSEMessage(sess *sse.Session, id, payload string) error {
@@ -502,14 +517,24 @@ func (s *Server) selectSession(threadIDHint string) (*session, error) {
 	if threadIDHint != "" {
 		if sessionID, ok := s.threadToSession[threadIDHint]; ok {
 			if sess, ok := s.sessions[sessionID]; ok {
-				s.sessionsMu.RUnlock()
-				return sess, nil
+				sess.mu.Lock()
+				alive := !sess.closed && !sess.stopRequested
+				sess.mu.Unlock()
+				if alive {
+					s.sessionsMu.RUnlock()
+					return sess, nil
+				}
 			}
 		}
 	}
 	for _, sess := range s.sessions {
-		s.sessionsMu.RUnlock()
-		return sess, nil
+		sess.mu.Lock()
+		alive := !sess.closed && !sess.stopRequested
+		sess.mu.Unlock()
+		if alive {
+			s.sessionsMu.RUnlock()
+			return sess, nil
+		}
 	}
 	s.sessionsMu.RUnlock()
 
@@ -557,12 +582,16 @@ func (s *Server) spawnSession() (*session, error) {
 
 func (s *Server) readSessionStdout(sess *session, reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20) // 1 MB max line
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
 		s.handleSessionLine(sess, line)
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[session=%d] stdout scanner error: %v", sess.id, err)
 	}
 }
 
@@ -607,6 +636,7 @@ func (s *Server) waitSessionExit(sess *session) {
 func (s *Server) handleSessionLine(sess *session, line string) {
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(line), &parsed); err != nil {
+		log.Printf("[session=%d] malformed JSON from upstream: %v", sess.id, err)
 		return
 	}
 	s.markSessionActivity(sess)
@@ -641,6 +671,7 @@ func (s *Server) handleSessionLine(sess *session, line string) {
 
 	if idFloat, ok := parsed["id"].(float64); ok {
 		if threadID == "" {
+			log.Printf("[session=%d] dropping upstream request %s (id=%.0f): cannot infer threadId", sess.id, method, idFloat)
 			return
 		}
 		s.bindThreadToSession(threadID, sess)
@@ -677,6 +708,8 @@ func (s *Server) handleSessionLine(sess *session, line string) {
 	if threadID != "" {
 		s.bindThreadToSession(threadID, sess)
 		s.publishThreadEvent(threadID, line)
+	} else {
+		log.Printf("[session=%d] dropping notification %s: cannot infer threadId", sess.id, method)
 	}
 }
 
@@ -693,24 +726,23 @@ func (s *Server) inferThreadID(sess *session) string {
 }
 
 func (s *Server) ensureInitialized(sess *session) error {
-	if sess.upstreamInitialized.Load() {
-		return nil
-	}
-	response, err := s.callSessionRPC(context.Background(), sess, "initialize", map[string]any{
-		"clientInfo":   map[string]any{"name": "darkhold-go", "title": "Darkhold Go", "version": "0.1.0"},
-		"capabilities": map[string]any{"experimentalApi": true},
-	})
-	if err != nil {
-		return err
-	}
-	if errObj, ok := response["error"].(map[string]any); ok {
-		message, _ := errObj["message"].(string)
-		if !strings.Contains(strings.ToLower(message), "already initialized") {
-			return errors.New(message)
+	sess.initOnce.Do(func() {
+		response, err := s.callSessionRPC(context.Background(), sess, "initialize", map[string]any{
+			"clientInfo":   map[string]any{"name": "darkhold-go", "title": "Darkhold Go", "version": "0.1.0"},
+			"capabilities": map[string]any{"experimentalApi": true},
+		})
+		if err != nil {
+			sess.initErr = err
+			return
 		}
-	}
-	sess.upstreamInitialized.Store(true)
-	return nil
+		if errObj, ok := response["error"].(map[string]any); ok {
+			message, _ := errObj["message"].(string)
+			if !strings.Contains(strings.ToLower(message), "already initialized") {
+				sess.initErr = errors.New(message)
+			}
+		}
+	})
+	return sess.initErr
 }
 
 func (s *Server) callSessionRPC(ctx context.Context, sess *session, method string, params any) (map[string]any, error) {
@@ -725,7 +757,7 @@ func (s *Server) callSessionRPC(ctx context.Context, sess *session, method strin
 	sess.pending[requestID] = responseCh
 	sess.mu.Unlock()
 
-	payload := map[string]any{"id": requestID, "method": method, "params": params}
+	payload := map[string]any{"jsonrpc": "2.0", "id": requestID, "method": method, "params": params}
 	encoded, _ := json.Marshal(payload)
 	s.markSessionActivity(sess)
 	if err := s.writeSessionLine(sess, string(encoded)); err != nil {
@@ -741,11 +773,11 @@ func (s *Server) callSessionRPC(ctx context.Context, sess *session, method strin
 		delete(sess.pending, requestID)
 		sess.mu.Unlock()
 		return nil, ctx.Err()
-	case <-time.After(20 * time.Second):
+	case <-time.After(s.rpcTimeout):
 		sess.mu.Lock()
 		delete(sess.pending, requestID)
 		sess.mu.Unlock()
-		return nil, fmt.Errorf("RPC request timed out: %s", method)
+		return nil, fmt.Errorf("RPC request timed out after %s: %s", s.rpcTimeout, method)
 	case response, ok := <-responseCh:
 		if !ok {
 			return nil, errors.New("app-server session closed")
@@ -756,10 +788,14 @@ func (s *Server) callSessionRPC(ctx context.Context, sess *session, method strin
 
 func (s *Server) writeSessionLine(sess *session, line string) error {
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
 	if sess.closed {
+		sess.mu.Unlock()
 		return errors.New("app-server session is unavailable")
 	}
+	sess.mu.Unlock()
+
+	sess.writeMu.Lock()
+	defer sess.writeMu.Unlock()
 	_, err := io.WriteString(sess.stdin, line+"\n")
 	return err
 }
@@ -769,29 +805,39 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		close(s.reaperStop)
 	})
 
+	s.sessionsMu.RLock()
+	sessions := make([]*session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.sessionsMu.RUnlock()
+
+	for _, sess := range sessions {
+		if sess.cmd.Process != nil {
+			_ = sess.cmd.Process.Signal(os.Interrupt)
+		}
+	}
+
 	done := make(chan struct{})
 	go func() {
-		s.sessionsMu.RLock()
-		sessions := make([]*session, 0, len(s.sessions))
-		for _, sess := range s.sessions {
-			sessions = append(sessions, sess)
-		}
-		s.sessionsMu.RUnlock()
 		for _, sess := range sessions {
-			if sess.cmd.Process != nil {
-				_ = sess.cmd.Process.Signal(os.Interrupt)
-			}
+			_ = sess.cmd.Wait()
 		}
 		close(done)
 	}()
 
 	select {
 	case <-done:
-		_ = s.sseProvider.Shutdown(ctx)
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		for _, sess := range sessions {
+			if sess.cmd.Process != nil {
+				_ = sess.cmd.Process.Kill()
+			}
+		}
 	}
+
+	_ = s.sseProvider.Shutdown(ctx)
+	return nil
 }
 
 func (s *Server) sessionIdleReaper() {
@@ -809,23 +855,35 @@ func (s *Server) sessionIdleReaper() {
 		}
 		s.sessionsMu.RUnlock()
 		for _, sess := range sessions {
-			if s.shouldReapSession(sess, now) {
-				s.requestSessionStop(sess)
-			}
+			s.tryReapSession(sess, now)
 		}
 	}
 }
 
-func (s *Server) shouldReapSession(sess *session, now time.Time) bool {
+// tryReapSession atomically checks idle conditions and marks stopRequested
+// in a single lock acquisition, preventing a turn from starting between
+// the check and the stop signal.
+func (s *Server) tryReapSession(sess *session, now time.Time) bool {
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
 	if sess.closed || sess.stopRequested {
+		sess.mu.Unlock()
 		return false
 	}
 	if len(sess.activeTurnIDs) > 0 {
+		sess.mu.Unlock()
 		return false
 	}
-	return now.Sub(sess.lastActivityAt) >= s.getSessionIdleTTL()
+	if now.Sub(sess.lastActivityAt) < s.getSessionIdleTTL() {
+		sess.mu.Unlock()
+		return false
+	}
+	sess.stopRequested = true
+	sess.mu.Unlock()
+
+	if sess.cmd.Process != nil {
+		_ = sess.cmd.Process.Signal(os.Interrupt)
+	}
+	return true
 }
 
 func (s *Server) setSessionTiming(idleTTL, reapInterval time.Duration) {
@@ -845,20 +903,6 @@ func (s *Server) getSessionReapInterval() time.Duration {
 	s.sessionTimingMu.RLock()
 	defer s.sessionTimingMu.RUnlock()
 	return s.sessionReapInterval
-}
-
-func (s *Server) requestSessionStop(sess *session) {
-	sess.mu.Lock()
-	if sess.closed || sess.stopRequested {
-		sess.mu.Unlock()
-		return
-	}
-	sess.stopRequested = true
-	sess.mu.Unlock()
-
-	if sess.cmd.Process != nil {
-		_ = sess.cmd.Process.Signal(os.Interrupt)
-	}
 }
 
 func (s *Server) markSessionActivity(sess *session) {
