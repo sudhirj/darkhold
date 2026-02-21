@@ -99,6 +99,26 @@ The server is the only component that talks to `codex app-server`, and it does s
   - Classify transient vs conversation events.
   - Derive role and render behavior from server event payloads.
 
+### Transient Event Policy
+- Source of truth:
+  - `clients/web/src/session-utils.ts:isTransientProgressEvent`.
+- Current conversation (non-transient) event types:
+  - `user.input`
+  - `assistant.output` (only when message text is non-empty)
+  - `turn.completed`
+  - `turn.error`
+- Current non-transient metadata event types:
+  - `session.created`
+- Current transient event types (known examples):
+  - `agent.delta`
+  - `command.<state>` (for example `command.started`, `command.completed`)
+  - `file.change`
+  - `mcp.tool`
+  - `item.<type>` fallback event types produced by item summarization
+  - `assistant.output` with empty message text
+- Rule:
+  - Treat transient events as best-effort progress signals only. They may be dropped, reordered, or absent after reconnect/rehydration and must not be used as the sole source for durable UI decisions (session status, turn completion, canonical conversation history, or gating user actions).
+
 ### UI Components
 - `clients/web/src/components/folder-browser-dialog.tsx`
 - Responsibilities:

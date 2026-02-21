@@ -5,6 +5,7 @@ import { roleForEvent } from '../session-utils';
 type AgentThreadPanelProps = {
   session: Session | null;
   conversationEvents: AgentEvent[];
+  assistantTypingText?: string;
   conversationEndRef: React.RefObject<HTMLDivElement | null>;
   promptDockRef: React.RefObject<HTMLFormElement | null>;
   promptInputRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -17,6 +18,7 @@ type AgentThreadPanelProps = {
 export function AgentThreadPanel({
   session,
   conversationEvents,
+  assistantTypingText = '',
   conversationEndRef,
   promptDockRef,
   promptInputRef,
@@ -99,6 +101,28 @@ export function AgentThreadPanel({
                 </div>
               </li>
             ))}
+            {assistantTypingText.trim().length > 0 ? (
+              <li className="list-group-item border-0 bg-transparent p-0 mb-2">
+                <div className="turn-event-group rounded-3 border overflow-hidden">
+                  <div className="ps-2 py-2 list-group-item-light">
+                    <div className="d-flex align-items-baseline">
+                      <div className="flex-shrink-0 me-2">
+                        <span
+                          className="d-inline-flex align-items-center justify-content-center text-secondary"
+                          style={{ width: '1.75rem', height: '1.75rem' }}
+                          aria-hidden="true"
+                        >
+                          <i className="bi bi-robot" style={{ opacity: 0.6 }} />
+                        </span>
+                      </div>
+                      <div className="flex-grow-1">
+                        <pre className="mb-0 chat-text">{assistantTypingText}</pre>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </li>
+            ) : null}
             <li className="list-group-item border-0 bg-transparent p-0" aria-hidden="true">
               <div className="event-log-bottom-spacer" />
             </li>

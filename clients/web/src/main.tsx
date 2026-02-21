@@ -356,8 +356,16 @@ function App() {
         : [],
     [session?.currentTurnId, session?.events],
   );
+  const assistantTypingText = useMemo(
+    () =>
+      thinkingEvents
+        .filter((event) => event.type === 'agent.delta')
+        .map((event) => event.message)
+        .join(''),
+    [thinkingEvents],
+  );
 
-  const isLiveWorkActive = session?.status === 'running';
+  const isLiveWorkActive = session?.status === 'running' && session?.currentTurnId !== null;
 
   useEffect(() => {
     void initializeFolderBrowser();
@@ -753,9 +761,7 @@ function App() {
       const completedTurnId = extractTurnId(payload);
       const activeTurnId = activeTurnByThreadRef.current.get(payload.threadId) ?? null;
       const eventTurnId = completedTurnId ?? activeTurnId;
-      if (!completedTurnId || !activeTurnId || completedTurnId === activeTurnId) {
-        setThreadCurrentTurn(payload.threadId, null);
-      }
+      setThreadCurrentTurn(payload.threadId, null);
       const turnStatus = payload.turn?.status as string | undefined;
       const nextStatus: SessionStatus = turnStatus === 'failed' ? 'error' : 'idle';
       pushEventToSession(payload.threadId, 'turn.completed', `${nextCompletedTurnNumber(session, payload.threadId)}`, eventTurnId);
@@ -1091,6 +1097,7 @@ function App() {
         <AgentThreadPanel
           session={session}
           conversationEvents={conversationEvents}
+          assistantTypingText={assistantTypingText}
           conversationEndRef={conversationEndRef}
           promptDockRef={promptDockRef}
           promptInputRef={promptInputRef}
