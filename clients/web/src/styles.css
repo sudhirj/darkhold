@@ -31,19 +31,6 @@ input,
   overflow-y: auto;
 }
 
-.event-log {
-  white-space: pre-wrap;
-  background: transparent;
-}
-
-.event-log > .list-group-item {
-  background: transparent;
-}
-
-.turn-event-group {
-  background-color: rgba(255, 255, 255, 0.72);
-}
-
 .event-log-bottom-spacer {
   height: calc(var(--prompt-dock-height) + env(safe-area-inset-bottom));
 }
@@ -58,11 +45,6 @@ input,
 
 .chat-text {
   white-space: pre-wrap;
-}
-
-.user-message-text {
-  font-weight: 520;
-  opacity: 0.88;
 }
 
 .prompt-dock {

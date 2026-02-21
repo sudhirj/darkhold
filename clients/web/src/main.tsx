@@ -255,6 +255,77 @@ function buildThreadFromThreadRead(response: ThreadReadResponse): ThreadState {
   };
 }
 
+type StoredEvent = {
+  method: string;
+  params?: any;
+};
+
+function buildThreadFromStoredEvents(threadId: string, cwd: string, rawEvents: string[]): ThreadState {
+  const events: AgentEvent[] = [];
+  let seq = 0;
+
+  for (const raw of rawEvents) {
+    let parsed: StoredEvent;
+    try {
+      parsed = JSON.parse(raw) as StoredEvent;
+    } catch {
+      continue;
+    }
+
+    const method = parsed.method;
+    const payload = (parsed.params ?? {}) as any;
+    const turnId = extractTurnId(payload);
+
+    if (method === 'turn/completed') {
+      const turnStatus = typeof payload.turn?.status === 'string' ? payload.turn.status : '';
+      if (turnStatus === 'failed' && payload.turn?.error?.message) {
+        seq += 1;
+        events.push({ seq, timestamp: nowIso(), type: 'turn.error', message: payload.turn.error.message, turnId });
+      }
+      continue;
+    }
+
+    if ((method === 'item/started' || method === 'item/completed') && payload.item) {
+      if (method === 'item/started' && payload.item?.type === 'userMessage') {
+        continue;
+      }
+      const summary = summarizeThreadItem(payload.item);
+      if (!summary) {
+        continue;
+      }
+      seq += 1;
+      events.push({ seq, timestamp: nowIso(), type: summary.type, message: summary.message, turnId });
+      continue;
+    }
+
+    if (method === 'item/agentMessage/delta' && typeof payload.delta === 'string') {
+      seq += 1;
+      events.push({ seq, timestamp: nowIso(), type: 'agent.delta', message: payload.delta, turnId });
+      continue;
+    }
+  }
+
+  return {
+    id: threadId,
+    cwd,
+    updatedAt: nowIso(),
+    threadId,
+    latestEventSeq: seq,
+    events,
+  };
+}
+
+async function loadThreadEvents(threadId: string): Promise<string[]> {
+  try {
+    const result = await jsonFetch<{ threadId: string; events: string[] }>(
+      `/api/thread/events?threadId=${encodeURIComponent(threadId)}`,
+    );
+    return Array.isArray(result.events) ? result.events : [];
+  } catch {
+    return [];
+  }
+}
+
 async function rpcPost<T = unknown>(method: string, params?: unknown): Promise<T> {
   return await jsonFetch<T>('/api/rpc', {
     method: 'POST',
@@ -779,18 +850,50 @@ function App() {
   async function resumeThread(threadId: string, options?: { updateUrl?: boolean }) {
     try {
       setError(null);
-      let response: ThreadReadResponse;
+
+      // Step 1-3: Try RPC calls with graceful fallback.
+      let rpcThread: ThreadState | null = null;
+      let rpcCwd = '';
       try {
-        response = await rpcPost<ThreadReadResponse>('thread/resume', {
-          threadId,
-        });
+        const response = await rpcPost<ThreadReadResponse>('thread/resume', { threadId });
+        rpcThread = buildThreadFromThreadRead(response);
+        rpcCwd = response.thread.cwd;
       } catch {
-        response = await rpcPost<ThreadReadResponse>('thread/read', {
-          threadId,
-          includeTurns: true,
-        });
+        try {
+          const response = await rpcPost<ThreadReadResponse>('thread/read', { threadId, includeTurns: true });
+          rpcThread = buildThreadFromThreadRead(response);
+          rpcCwd = response.thread.cwd;
+        } catch {
+          try {
+            const response = await rpcPost<ThreadReadResponse>('thread/read', { threadId });
+            rpcCwd = response.thread.cwd;
+            // No turns — rpcThread stays null, we'll populate from event store.
+          } catch {
+            // All RPCs failed — fall through to event store.
+          }
+        }
       }
-      const loaded = buildThreadFromThreadRead(response);
+
+      // Step 4: Load stored events from the event store.
+      const storedEvents = await loadThreadEvents(threadId);
+
+      // Use RPC thread if it has events, otherwise build from stored events.
+      let loaded: ThreadState;
+      if (rpcThread && rpcThread.events.length > 0) {
+        loaded = rpcThread;
+      } else if (storedEvents.length > 0) {
+        // Resolve cwd: prefer RPC metadata, then thread selector, then empty.
+        const cwd = rpcCwd || threads.find((t) => t.id === threadId)?.cwd || '';
+        loaded = buildThreadFromStoredEvents(threadId, cwd, storedEvents);
+      } else if (rpcThread) {
+        // RPC succeeded but no events anywhere — use the empty RPC thread.
+        loaded = rpcThread;
+      } else {
+        // Nothing worked at all.
+        const cwd = threads.find((t) => t.id === threadId)?.cwd || '';
+        loaded = { id: threadId, cwd, updatedAt: nowIso(), threadId, latestEventSeq: 0, events: [] };
+      }
+
       setThread(loaded);
       if (options?.updateUrl !== false) {
         writeThreadIdToUrl(threadId);
@@ -809,13 +912,20 @@ function App() {
     if (!summary) {
       return;
     }
-    setThread({
-      id: summary.id,
-      cwd: summary.cwd,
-      updatedAt: summary.updatedAt,
-      threadId: summary.id,
-      latestEventSeq: 0,
-      events: [],
+    // Set thread metadata immediately so the panel shows cwd/id while loading.
+    // resumeThread() will replace this with the full state including stored events.
+    setThread((current) => {
+      if (current?.threadId === threadId) {
+        return current;
+      }
+      return {
+        id: summary.id,
+        cwd: summary.cwd,
+        updatedAt: summary.updatedAt,
+        threadId: summary.id,
+        latestEventSeq: 0,
+        events: [],
+      };
     });
   }
 

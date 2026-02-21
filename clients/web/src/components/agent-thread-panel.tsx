@@ -45,36 +45,20 @@ export function AgentThreadPanel({
 
       {thread ? (
         <>
-          <div className="small mb-2">
-            <strong>cwd:</strong> <code>{thread.cwd}</code>
-          </div>
-          <div className="small mb-2">
-            <strong>thread:</strong> <code>{thread.threadId ?? 'unknown'}</code>
-          </div>
-          <ul className="list-group event-log chat-log">
-            {visibleConversationEvents.length === 0 ? <li className="list-group-item text-secondary">No conversation yet.</li> : null}
-            {visibleConversationEvents.map((agentEvent, index) => {
+          <ul className="list-unstyled">
+            {visibleConversationEvents.length === 0 ? <li className="text-secondary p-3">No conversation yet.</li> : null}
+            {visibleConversationEvents.map((agentEvent) => {
               const role = roleForEvent(agentEvent);
               return (
-                <li key={agentEvent.seq} className="list-group-item border-0 bg-transparent p-0 mb-2">
-                  <div className="turn-event-group rounded-3 border overflow-hidden">
-                    <div
-                      className={`ps-2 py-2 ${rowClassForRole(role)} ${index > 0 ? 'border-top' : ''} ${
-                        role === 'user' ? 'border-bottom border-secondary-subtle' : ''
-                      }`}
-                    >
+                <li key={agentEvent.seq} className="mb-2">
+                  <div className={`card border rounded-3 overflow-hidden bg-white bg-opacity-75 ${rowClassForRole(role)}`}>
+                    <div className="card-body ps-2 py-2">
                       <div className="d-flex align-items-baseline">
-                        <div className="flex-shrink-0 me-2">
-                          <span
-                            className="d-inline-flex align-items-center justify-content-center text-secondary"
-                            style={{ width: '1.75rem', height: '1.75rem' }}
-                            aria-hidden="true"
-                          >
-                            {role === 'user' ? <i className="bi bi-person-fill" style={{ opacity: 0.6 }} /> : <i className="bi bi-robot" style={{ opacity: 0.6 }} />}
-                          </span>
+                        <div className="flex-shrink-0 me-2 text-secondary opacity-50">
+                          {role === 'user' ? <i className="bi bi-person-fill" /> : <i className="bi bi-robot" />}
                         </div>
                         <div className="flex-grow-1">
-                          <pre className={`mb-0 chat-text ${role === 'user' ? 'user-message-text' : ''}`}>{agentEvent.message}</pre>
+                          <pre className={`mb-0 chat-text ${role === 'user' ? 'fw-semibold opacity-75' : ''}`}>{agentEvent.message}</pre>
                         </div>
                       </div>
                     </div>
@@ -83,18 +67,12 @@ export function AgentThreadPanel({
               );
             })}
             {assistantTypingText.trim().length > 0 ? (
-              <li className="list-group-item border-0 bg-transparent p-0 mb-2">
-                <div className="turn-event-group typing-preview-box rounded-3 border overflow-hidden">
-                  <div className="ps-2 py-2 list-group-item-light">
+              <li className="mb-2">
+                <div className="card border rounded-3 overflow-hidden bg-white bg-opacity-75 typing-preview-box">
+                  <div className="card-body ps-2 py-2 list-group-item-light">
                     <div className="d-flex align-items-baseline">
-                      <div className="flex-shrink-0 me-2">
-                        <span
-                          className="d-inline-flex align-items-center justify-content-center text-secondary"
-                          style={{ width: '1.75rem', height: '1.75rem' }}
-                          aria-hidden="true"
-                        >
-                          <i className="bi bi-robot typing-preview-icon" />
-                        </span>
+                      <div className="flex-shrink-0 me-2 text-secondary opacity-50">
+                        <i className="bi bi-robot typing-preview-icon" />
                       </div>
                       <div className="flex-grow-1">
                         <pre className="mb-0 chat-text">{assistantTypingText}</pre>
@@ -104,10 +82,10 @@ export function AgentThreadPanel({
                 </div>
               </li>
             ) : null}
-            <li className="list-group-item border-0 bg-transparent p-0" aria-hidden="true">
+            <li aria-hidden="true">
               <div className="event-log-bottom-spacer" />
             </li>
-            <li className="list-group-item border-0 bg-transparent p-0" aria-hidden="true">
+            <li aria-hidden="true">
               <div ref={conversationEndRef} className="event-log-bottom-sentinel" />
             </li>
           </ul>
