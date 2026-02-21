@@ -323,6 +323,7 @@ function App() {
   const [uiAnswers, setUiAnswers] = useState<Record<string, string>>({});
   const [isSentinelInView, setIsSentinelInView] = useState(false);
   const [promptDockHeightPx, setPromptDockHeightPx] = useState(0);
+  const [isDebugPanelOpen, setIsDebugPanelOpen] = useState(false);
   const conversationEndRef = useRef<HTMLDivElement | null>(null);
   const promptDockRef = useRef<HTMLFormElement | null>(null);
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -457,6 +458,20 @@ function App() {
       conversationEndRef.current?.scrollIntoView({ block: 'end', inline: 'nearest' });
     });
   }, [session?.id, session?.latestEventSeq]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'd') {
+        event.preventDefault();
+        setIsDebugPanelOpen((current) => !current);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, []);
 
   useEffect(() => {
     activeThreadIdRef.current = session?.threadId ?? null;
@@ -826,10 +841,11 @@ function App() {
         (listedSessions.length > 0 ? listedSessions : current)
           .map((thread) => {
             const existing = current.find((item) => item.id === thread.id);
+            const updatedAt = typeof thread.updatedAt === 'number' ? unixSecondsToIso(thread.updatedAt) : thread.updatedAt;
             return {
               id: thread.id,
               cwd: thread.cwd,
-              updatedAt: unixSecondsToIso(thread.updatedAt),
+              updatedAt,
               status: existing?.status ?? 'idle',
             };
           })
@@ -1100,16 +1116,43 @@ function App() {
         </button>
       ) : null}
 
-      <aside
-        className="position-fixed top-0 end-0 mt-5 me-3 p-2 border rounded bg-light shadow-sm font-mono small"
-        style={{ zIndex: 1055, minWidth: '220px', opacity: 0.9 }}
-        aria-label="Scroll debug panel"
-      >
-        <div className="fw-semibold mb-1">Debug</div>
-        <div>sentinelInView: {isSentinelInView ? 'yes' : 'no'}</div>
-        <div>promptDockHeight: {Math.round(promptDockHeightPx)}px</div>
-        <div>liveActive: {isLiveWorkActive ? 'yes' : 'no'}</div>
-      </aside>
+      <div className="position-fixed top-0 end-0 mt-5 me-3 d-flex flex-column align-items-end gap-2" style={{ zIndex: 1055 }}>
+        <button
+          type="button"
+          className="btn btn-sm btn-light border shadow-sm d-inline-flex align-items-center gap-2 font-mono"
+          onClick={() => setIsDebugPanelOpen((current) => !current)}
+          aria-label={isDebugPanelOpen ? 'Hide debug panel' : 'Show debug panel'}
+          title="Toggle debug panel (Ctrl/Cmd+Shift+D)"
+        >
+          <i className={`bi ${isDebugPanelOpen ? 'bi-bug-fill' : 'bi-bug'}`} aria-hidden="true" />
+          <span>Debug</span>
+        </button>
+
+        {isDebugPanelOpen ? (
+          <aside
+            className="p-2 border rounded bg-light shadow-sm font-mono small"
+            style={{ minWidth: '220px', opacity: 0.95 }}
+            aria-label="Scroll debug panel"
+          >
+            <div className="d-flex align-items-center justify-content-between gap-2 mb-1">
+              <div className="fw-semibold">Debug</div>
+              <button
+                type="button"
+                className="btn btn-sm btn-outline-secondary py-0 px-1"
+                onClick={() => setIsDebugPanelOpen(false)}
+                aria-label="Close debug panel"
+                title="Close debug panel"
+              >
+                <i className="bi bi-x-lg" aria-hidden="true" />
+              </button>
+            </div>
+            <div>sentinelInView: {isSentinelInView ? 'yes' : 'no'}</div>
+            <div>promptDockHeight: {Math.round(promptDockHeightPx)}px</div>
+            <div>liveActive: {isLiveWorkActive ? 'yes' : 'no'}</div>
+            <div className="text-secondary mt-1">Shortcut: Ctrl/Cmd+Shift+D</div>
+          </aside>
+        ) : null}
+      </div>
 
       {isThinkingDialogOpen ? (
         <Dialog open onClose={() => setIsThinkingDialogOpen(false)} className="position-relative">
