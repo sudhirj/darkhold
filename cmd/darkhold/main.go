@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -28,8 +27,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	eventsTmpRoot := filepath.Join(os.TempDir(), fmt.Sprintf("darkhold-go-events-%d", os.Getpid()))
-	if err := os.MkdirAll(eventsTmpRoot, 0o755); err != nil {
+	eventsTmpRoot, err := os.MkdirTemp("", "darkhold-events-")
+	if err != nil {
 		log.Fatal(err)
 	}
 	store := events.NewStore(eventsTmpRoot)

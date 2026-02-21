@@ -153,6 +153,80 @@ The server is the only component that talks to `codex app-server`, and it does s
   - Any client connected to the same thread receives new thread events.
   - Any client may answer interaction requests; resolution is first-write-wins.
 
+## Event Transformation Matrix
+This section enumerates the current event transformations/enrichments and why each exists. The goal is to keep only changes that are logically required for protocol bridging, replayability, or UI semantics.
+
+### Native Codex Events Passed Through
+- Source: `codex app-server` notifications on stdio.
+- Path: `internal/server/server.go` (`handleSessionLine`, non-request notifications).
+- Native methods forwarded as-is to thread SSE log:
+  - `turn/started`
+  - `turn/completed`
+  - `item/started`
+  - `item/completed`
+  - `item/agentMessage/delta`
+  - `error`
+- Why no transform:
+  - Preserves canonical upstream semantics.
+  - Avoids unnecessary coupling or schema drift.
+
+### Server-Side Synthetic Wrappers
+1. Upstream interaction requests -> `darkhold/interaction/request`
+- Where: `internal/server/server.go` (`handleSessionLine` for upstream request-shaped frames with `id`).
+- Transform:
+  - Wraps native upstream request method/params into:
+    - `method: darkhold/interaction/request`
+    - `params: { threadId, requestId, method, params }`
+- Why required:
+  - Standardizes all approval/input prompts behind one UI handling path.
+  - Provides stable `requestId` for multi-client first-write-wins response over HTTP.
+
+2. Interaction response ack -> `darkhold/interaction/resolved`
+- Where: `internal/server/server.go` (`handleInteractionRespond`).
+- Transform:
+  - Emits:
+    - `method: darkhold/interaction/resolved`
+    - `params: { threadId, requestId, source: "http" }`
+- Why required:
+  - Broadcasts prompt resolution to all clients on the thread.
+  - Keeps append-only stream consistent for reconnect/replay.
+
+3. Thread read rehydrate -> `darkhold/thread-event` + synthetic `turn/completed`
+- Where: `internal/events/store.go` (`RehydrateFromThreadRead`).
+- Transform:
+  - Normalizes historical `thread.turns[*].items[*]` into:
+    - `darkhold/thread-event` with `{type, message, source:"thread/read"}`
+  - Adds synthetic `turn/completed` per historical turn.
+  - Adds synthetic `turn.error` (`darkhold/thread-event`) when read turn status is failed.
+- Why required:
+  - Rebuilds append-only stream from snapshot APIs.
+  - Enables SSE resume with `Last-Event-ID` against durable thread log.
+
+### Web-Side Normalization (UI Model)
+1. Item-to-UI event typing
+- Where: `clients/web/src/main.tsx` (`summarizeThreadItem`).
+- Transform examples:
+  - `userMessage` -> `user.input`
+  - `agentMessage` -> `assistant.output`
+  - `commandExecution` -> `command.<status>`
+  - `fileChange` -> `file.change`
+  - `mcpToolCall` -> `mcp.tool`
+- Why required:
+  - Produces a stable, renderable UI event taxonomy independent of raw item shape differences.
+
+2. Synthetic turn identifiers when missing
+- Where:
+  - Historical: `syntheticReadTurnId` in `clients/web/src/main.tsx`
+  - Live fallback: `live-turn:<threadId>:<timestamp>` in `handleNotification`
+- Why required:
+  - Keeps event grouping deterministic even if upstream omits turn IDs in some frames.
+
+3. Conversation vs transient classification
+- Where: `clients/web/src/session-utils.ts` (`isConversationEvent`, `isTransientProgressEvent`).
+- Why required:
+  - Separates durable transcript content from ephemeral operational progress.
+  - Prevents debug/progress noise from polluting chat transcript.
+
 ## Development Modes
 - Embedded bundle mode: `./dev-hot`
   - Rebuild web bundle and Go binary on change, restart server.

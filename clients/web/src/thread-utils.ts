@@ -28,5 +28,5 @@ export function isConversationEvent(event: AgentEvent): boolean {
 
 export function isTransientProgressEvent(event: AgentEvent): boolean {
   // Policy reference: docs/architecture.md ("Transient Event Policy").
-  return !isConversationEvent(event) && event.type !== 'session.created' && event.type !== 'turn.completed';
+  return !isConversationEvent(event) && event.type !== 'thread.created' && event.type !== 'turn.completed';
 }

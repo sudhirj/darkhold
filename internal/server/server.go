@@ -2,7 +2,6 @@ package server
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -25,6 +24,7 @@ import (
 	"darkhold-go/internal/config"
 	"darkhold-go/internal/events"
 	browserfs "darkhold-go/internal/fs"
+	sse "github.com/tmaxmax/go-sse"
 )
 
 //go:embed webdist/*
@@ -84,18 +84,38 @@ type Server struct {
 	threadsMu        sync.RWMutex
 	knownThreads     map[string]threadSummary
 
-	sseMu          sync.Mutex
-	sseSubs        map[string]map[int]chan string
-	sseNextEventID map[string]int
-	nextSSESubID   int
+	sseProvider sse.Provider
 
 	publishMu sync.Mutex
 
+	sessionTimingMu     sync.RWMutex
 	sessionIdleTTL      time.Duration
 	sessionReapInterval time.Duration
 }
 
+type channelMessageWriter struct {
+	ch chan *sse.Message
+}
+
+func (w *channelMessageWriter) Send(message *sse.Message) error {
+	select {
+	case w.ch <- message.Clone():
+		return nil
+	default:
+		return errors.New("sse subscriber is backpressured")
+	}
+}
+
+func (w *channelMessageWriter) Flush() error {
+	return nil
+}
+
 func New(cfg config.Config, eventStore *events.Store) *Server {
+	replayer, err := sse.NewValidReplayer(24*time.Hour, false)
+	if err != nil {
+		panic(err)
+	}
+	provider := &sse.Joe{Replayer: replayer}
 	s := &Server{
 		cfg:                 cfg,
 		eventStore:          eventStore,
@@ -104,8 +124,7 @@ func New(cfg config.Config, eventStore *events.Store) *Server {
 		threadToSession:     map[string]int{},
 		pendingResponses:    map[string]map[string]pendingInteraction{},
 		knownThreads:        map[string]threadSummary{},
-		sseSubs:             map[string]map[int]chan string{},
-		sseNextEventID:      map[string]int{},
+		sseProvider:         provider,
 		sessionIdleTTL:      5 * time.Minute,
 		sessionReapInterval: 5 * time.Second,
 	}
@@ -198,80 +217,65 @@ func (s *Server) handleThreadEventsStream(w http.ResponseWriter, r *http.Request
 	if lastEventIDRaw == "" {
 		lastEventIDRaw = strings.TrimSpace(r.URL.Query().Get("lastEventId"))
 	}
-	startEventID := 1
-	if lastEventIDRaw != "" {
-		if parsed, err := strconv.Atoi(lastEventIDRaw); err == nil && parsed >= 0 {
-			startEventID = parsed + 1
-		}
-	}
-
-	history, err := s.eventStore.Read(threadID)
+	history, err := s.eventStore.ReadRecords(threadID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming is not supported"})
+	sess, err := sse.Upgrade(w, r)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-
-	s.sseMu.Lock()
-	nextFromHistory := len(history) + 1
-	if existing := s.sseNextEventID[threadID]; existing < nextFromHistory {
-		s.sseNextEventID[threadID] = nextFromHistory
+	ready := &sse.Message{}
+	ready.AppendComment("ready")
+	if err := sess.Send(ready); err != nil {
+		return
 	}
-	s.nextSSESubID++
-	subID := s.nextSSESubID
-	subs := s.sseSubs[threadID]
-	if subs == nil {
-		subs = map[int]chan string{}
-		s.sseSubs[threadID] = subs
-	}
-	ch := make(chan string, 128)
-	subs[subID] = ch
-	s.sseMu.Unlock()
+	_ = sess.Flush()
 
-	defer func() {
-		s.sseMu.Lock()
-		if subs := s.sseSubs[threadID]; subs != nil {
-			delete(subs, subID)
-			if len(subs) == 0 {
-				delete(s.sseSubs, threadID)
-			}
+	for _, record := range history {
+		if lastEventIDRaw != "" && record.ID <= lastEventIDRaw {
+			continue
 		}
-		s.sseMu.Unlock()
-	}()
-
-	for idx := max(0, startEventID-1); idx < len(history); idx++ {
-		if _, err := io.WriteString(w, sseFrame(idx+1, history[idx])); err != nil {
+		if err := sendSSEMessage(sess, record.ID, record.Payload); err != nil {
 			return
 		}
 	}
-	flusher.Flush()
-
-	keepAlive := time.NewTicker(15 * time.Second)
-	defer keepAlive.Stop()
-
+	_ = sess.Flush()
+	replayCursor := lastEventIDRaw
+	for _, record := range history {
+		if replayCursor == "" || record.ID > replayCursor {
+			replayCursor = record.ID
+		}
+	}
+	writer := &channelMessageWriter{ch: make(chan *sse.Message, 128)}
+	sub := sse.Subscription{
+		Client: writer,
+		Topics: []string{threadID},
+	}
+	if replayCursor != "" {
+		sub.LastEventID = sse.ID(replayCursor)
+	}
+	subscribeErr := make(chan error, 1)
+	go func() {
+		subscribeErr <- s.sseProvider.Subscribe(r.Context(), sub)
+	}()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case frame := <-ch:
-			if _, err := io.WriteString(w, frame); err != nil {
+		case err := <-subscribeErr:
+			if err != nil && !errors.Is(err, context.Canceled) {
 				return
 			}
-			flusher.Flush()
-		case <-keepAlive.C:
-			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+			return
+		case message := <-writer.ch:
+			if err := sess.Send(message); err != nil {
 				return
 			}
-			flusher.Flush()
+			_ = sess.Flush()
 		}
 	}
 }
@@ -428,6 +432,10 @@ func (s *Server) handleWeb(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestPath := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+	if requestPath == "api" || strings.HasPrefix(requestPath, "api/") {
+		http.NotFound(w, r)
+		return
+	}
 	if requestPath == "" || requestPath == "." {
 		requestPath = "index.html"
 	}
@@ -461,47 +469,19 @@ func (s *Server) publishThreadEvent(threadID, payload string) {
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
 
-	if err := s.eventStore.Append(threadID, payload); err != nil {
+	eventID, err := s.eventStore.Append(threadID, payload)
+	if err != nil {
 		return
 	}
-	nextID := s.sseNextEventID[threadID]
-	if nextID == 0 {
-		history, err := s.eventStore.Read(threadID)
-		if err != nil {
-			return
-		}
-		nextID = len(history)
-	}
-	nextID++
-	s.sseNextEventID[threadID] = nextID
-	frame := sseFrame(nextID, payload)
-
-	s.sseMu.Lock()
-	subs := s.sseSubs[threadID]
-	for id, ch := range subs {
-		select {
-		case ch <- frame:
-		default:
-			delete(subs, id)
-		}
-	}
-	if len(subs) == 0 {
-		delete(s.sseSubs, threadID)
-	}
-	s.sseMu.Unlock()
+	msg := &sse.Message{ID: sse.ID(eventID)}
+	msg.AppendData(payload)
+	_ = s.sseProvider.Publish(msg, []string{threadID})
 }
 
-func sseFrame(id int, payload string) string {
-	parts := strings.Split(payload, "\n")
-	var b bytes.Buffer
-	b.WriteString(fmt.Sprintf("id: %d\n", id))
-	for _, part := range parts {
-		b.WriteString("data: ")
-		b.WriteString(part)
-		b.WriteString("\n")
-	}
-	b.WriteString("\n")
-	return b.String()
+func sendSSEMessage(sess *sse.Session, id, payload string) error {
+	msg := &sse.Message{ID: sse.ID(id)}
+	msg.AppendData(payload)
+	return sess.Send(msg)
 }
 
 func (s *Server) bindThreadToSession(threadID string, sess *session) {
@@ -807,6 +787,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
+		_ = s.sseProvider.Shutdown(ctx)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -818,7 +799,7 @@ func (s *Server) sessionIdleReaper() {
 		select {
 		case <-s.reaperStop:
 			return
-		case <-time.After(s.sessionReapInterval):
+		case <-time.After(s.getSessionReapInterval()):
 		}
 		now := time.Now()
 		s.sessionsMu.RLock()
@@ -844,7 +825,26 @@ func (s *Server) shouldReapSession(sess *session, now time.Time) bool {
 	if len(sess.activeTurnIDs) > 0 {
 		return false
 	}
-	return now.Sub(sess.lastActivityAt) >= s.sessionIdleTTL
+	return now.Sub(sess.lastActivityAt) >= s.getSessionIdleTTL()
+}
+
+func (s *Server) setSessionTiming(idleTTL, reapInterval time.Duration) {
+	s.sessionTimingMu.Lock()
+	s.sessionIdleTTL = idleTTL
+	s.sessionReapInterval = reapInterval
+	s.sessionTimingMu.Unlock()
+}
+
+func (s *Server) getSessionIdleTTL() time.Duration {
+	s.sessionTimingMu.RLock()
+	defer s.sessionTimingMu.RUnlock()
+	return s.sessionIdleTTL
+}
+
+func (s *Server) getSessionReapInterval() time.Duration {
+	s.sessionTimingMu.RLock()
+	defer s.sessionTimingMu.RUnlock()
+	return s.sessionReapInterval
 }
 
 func (s *Server) requestSessionStop(sess *session) {
@@ -900,11 +900,4 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

@@ -1,9 +1,9 @@
 import React, { FormEvent } from 'react';
-import { AgentEvent, Session } from '../types';
-import { roleForEvent } from '../session-utils';
+import { AgentEvent, ThreadState } from '../types';
+import { roleForEvent } from '../thread-utils';
 
 type AgentThreadPanelProps = {
-  session: Session | null;
+  thread: ThreadState | null;
   conversationEvents: AgentEvent[];
   assistantTypingText?: string;
   conversationEndRef: React.RefObject<HTMLDivElement | null>;
@@ -16,7 +16,7 @@ type AgentThreadPanelProps = {
 };
 
 export function AgentThreadPanel({
-  session,
+  thread,
   conversationEvents,
   assistantTypingText = '',
   conversationEndRef,
@@ -28,17 +28,6 @@ export function AgentThreadPanel({
   onPromptChange,
 }: AgentThreadPanelProps) {
   const visibleConversationEvents = conversationEvents.filter((event) => event.type !== 'turn.completed');
-
-  const turnGroups = visibleConversationEvents.reduce<Array<{ key: string; events: AgentEvent[] }>>((groups, event) => {
-    const groupKey = event.turnId ?? `no-turn:${event.seq}`;
-    const current = groups[groups.length - 1];
-    if (!current || current.key !== groupKey) {
-      groups.push({ key: groupKey, events: [event] });
-      return groups;
-    }
-    current.events.push(event);
-    return groups;
-  }, []);
 
   const rowClassForRole = (role: 'user' | 'assistant' | 'system') => {
     if (role === 'user') {
@@ -52,55 +41,47 @@ export function AgentThreadPanel({
 
   return (
     <>
-      {!session ? <p className="text-secondary mb-0">No active session yet.</p> : null}
+      {!thread ? <p className="text-secondary mb-0">No active thread yet.</p> : null}
 
-      {session ? (
+      {thread ? (
         <>
           <div className="small mb-2">
-            <strong>cwd:</strong> <code>{session.cwd}</code>
+            <strong>cwd:</strong> <code>{thread.cwd}</code>
           </div>
           <div className="small mb-2">
-            <strong>thread:</strong> <code>{session.threadId ?? 'unknown'}</code>
+            <strong>thread:</strong> <code>{thread.threadId ?? 'unknown'}</code>
           </div>
-          <div className="small mb-3">
-            <strong>progress:</strong> {session.progress.completedItems} items complete
-            {session.progress.lastEventType ? `, last event ${session.progress.lastEventType}` : ''}
-          </div>
-
           <ul className="list-group event-log chat-log">
             {visibleConversationEvents.length === 0 ? <li className="list-group-item text-secondary">No conversation yet.</li> : null}
-            {turnGroups.map((group) => (
-              <li key={group.key} className="list-group-item border-0 bg-transparent p-0 mb-2">
-                <div className="turn-event-group rounded-3 border overflow-hidden">
-                  {group.events.map((agentEvent, index) => {
-                    const role = roleForEvent(agentEvent);
-                    return (
-                      <div
-                        key={agentEvent.seq}
-                        className={`ps-2 py-2 ${rowClassForRole(role)} ${index > 0 ? 'border-top' : ''} ${
-                          role === 'user' ? 'border-bottom border-secondary-subtle' : ''
-                        }`}
-                      >
-                        <div className="d-flex align-items-baseline">
-                          <div className="flex-shrink-0 me-2">
-                            <span
-                              className="d-inline-flex align-items-center justify-content-center text-secondary"
-                              style={{ width: '1.75rem', height: '1.75rem' }}
-                              aria-hidden="true"
-                            >
-                              {role === 'user' ? <i className="bi bi-person-fill" style={{ opacity: 0.6 }} /> : <i className="bi bi-robot" style={{ opacity: 0.6 }} />}
-                            </span>
-                          </div>
-                          <div className="flex-grow-1">
-                            <pre className={`mb-0 chat-text ${role === 'user' ? 'user-message-text' : ''}`}>{agentEvent.message}</pre>
-                          </div>
+            {visibleConversationEvents.map((agentEvent, index) => {
+              const role = roleForEvent(agentEvent);
+              return (
+                <li key={agentEvent.seq} className="list-group-item border-0 bg-transparent p-0 mb-2">
+                  <div className="turn-event-group rounded-3 border overflow-hidden">
+                    <div
+                      className={`ps-2 py-2 ${rowClassForRole(role)} ${index > 0 ? 'border-top' : ''} ${
+                        role === 'user' ? 'border-bottom border-secondary-subtle' : ''
+                      }`}
+                    >
+                      <div className="d-flex align-items-baseline">
+                        <div className="flex-shrink-0 me-2">
+                          <span
+                            className="d-inline-flex align-items-center justify-content-center text-secondary"
+                            style={{ width: '1.75rem', height: '1.75rem' }}
+                            aria-hidden="true"
+                          >
+                            {role === 'user' ? <i className="bi bi-person-fill" style={{ opacity: 0.6 }} /> : <i className="bi bi-robot" style={{ opacity: 0.6 }} />}
+                          </span>
+                        </div>
+                        <div className="flex-grow-1">
+                          <pre className={`mb-0 chat-text ${role === 'user' ? 'user-message-text' : ''}`}>{agentEvent.message}</pre>
                         </div>
                       </div>
-                    );
-                  })}
-                </div>
-              </li>
-            ))}
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
             {assistantTypingText.trim().length > 0 ? (
               <li className="list-group-item border-0 bg-transparent p-0 mb-2">
                 <div className="turn-event-group typing-preview-box rounded-3 border overflow-hidden">

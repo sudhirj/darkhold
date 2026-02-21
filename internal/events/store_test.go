@@ -15,10 +15,10 @@ func TestAppendAndRead(t *testing.T) {
 	}
 	store := NewStore(root)
 
-	if err := store.Append("thread-1", `{"method":"turn/started"}`); err != nil {
+	if _, err := store.Append("thread-1", `{"method":"turn/started"}`); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Append("thread-1", `{"method":"turn/completed"}`); err != nil {
+	if _, err := store.Append("thread-1", `{"method":"turn/completed"}`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -43,7 +43,7 @@ func TestConcurrentAppend(t *testing.T) {
 		wg.Add(1)
 		go func(v int) {
 			defer wg.Done()
-			_ = store.Append("thread-2", `{"method":"event","seq":`+jsonNumber(v)+`}`)
+			_, _ = store.Append("thread-2", `{"method":"event","seq":`+jsonNumber(v)+`}`)
 		}(i)
 	}
 	wg.Wait()
@@ -64,7 +64,7 @@ func TestRehydrateFromThreadRead(t *testing.T) {
 	}
 	store := NewStore(root)
 
-	_ = store.Append("thread-3", `{"method":"stale"}`)
+	_, _ = store.Append("thread-3", `{"method":"stale"}`)
 
 	readResult := map[string]any{
 		"thread": map[string]any{
@@ -93,18 +93,11 @@ func TestRehydrateFromThreadRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) < 4 {
-		t.Fatalf("expected rehydrated events, got %d", len(events))
+	if len(events) != 1 {
+		t.Fatalf("rehydrate should not transform events; got %d event(s)", len(events))
 	}
-	joined := joinLines(events)
-	if contains(joined, "stale") {
-		t.Fatal("stale event should be replaced")
-	}
-	if !contains(joined, "assistant.output") {
-		t.Fatal("assistant output missing")
-	}
-	if !contains(joined, "turn.error") {
-		t.Fatal("turn.error missing")
+	if !contains(events[0], "stale") {
+		t.Fatal("original raw event should remain unchanged")
 	}
 }
 
@@ -114,7 +107,7 @@ func TestCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := NewStore(root)
-	if err := store.Append("thread-4", `{"method":"turn/started"}`); err != nil {
+	if _, err := store.Append("thread-4", `{"method":"turn/started"}`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Cleanup(); err != nil {

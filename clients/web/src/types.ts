@@ -19,26 +19,17 @@ export type AgentEvent = {
   turnId: string | null;
 };
 
-export type SessionStatus = 'idle' | 'running' | 'error';
-
-export type Session = {
+export type ThreadState = {
   id: string;
   cwd: string;
-  status: SessionStatus;
   updatedAt: string;
   threadId: string;
-  currentTurnId: string | null;
   latestEventSeq: number;
-  progress: {
-    completedItems: number;
-    lastEventType: string | null;
-  };
   events: AgentEvent[];
 };
 
-export type SessionSummary = {
+export type ThreadSummary = {
   id: string;
   cwd: string;
-  status: SessionStatus;
   updatedAt: string;
 };

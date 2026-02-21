@@ -8,8 +8,8 @@ import './styles.css';
 import { jsonFetch } from './api';
 import { FolderBrowserDialog } from './components/folder-browser-dialog';
 import { AgentThreadPanel } from './components/agent-thread-panel';
-import { isConversationEvent, isTransientProgressEvent } from './session-utils';
-import { AgentEvent, FolderEntry, FolderListing, Session, SessionStatus, SessionSummary } from './types';
+import { isConversationEvent, isTransientProgressEvent } from './thread-utils';
+import { AgentEvent, FolderEntry, FolderListing, ThreadState, ThreadSummary } from './types';
 
 type JsonRpcRequest = {
   id: number;
@@ -80,16 +80,6 @@ function unixSecondsToIso(seconds: number): string {
   return new Date(seconds * 1000).toISOString();
 }
 
-function statusFromTurnStatus(status: ThreadReadTurn['status']): SessionStatus {
-  if (status === 'inProgress') {
-    return 'running';
-  }
-  if (status === 'failed') {
-    return 'error';
-  }
-  return 'idle';
-}
-
 function toNumber(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
@@ -137,18 +127,18 @@ function isThreadNotFoundError(error: unknown): boolean {
   return message.toLowerCase().includes('thread not found');
 }
 
-function readSessionIdFromUrl(): string | null {
+function readThreadIdFromUrl(): string | null {
   const params = new URLSearchParams(window.location.search);
-  const sessionId = params.get('session');
-  return sessionId && sessionId.trim().length > 0 ? sessionId : null;
+  const threadId = params.get('thread');
+  return threadId && threadId.trim().length > 0 ? threadId : null;
 }
 
-function writeSessionIdToUrl(sessionId: string | null) {
+function writeThreadIdToUrl(threadId: string | null) {
   const url = new URL(window.location.href);
-  if (sessionId) {
-    url.searchParams.set('session', sessionId);
+  if (threadId) {
+    url.searchParams.set('thread', threadId);
   } else {
-    url.searchParams.delete('session');
+    url.searchParams.delete('thread');
   }
   window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
 }
@@ -221,18 +211,9 @@ function extractTurnId(payload: any): string | null {
   return null;
 }
 
-function nextCompletedTurnNumber(current: Session | null, threadId: string): number {
-  if (!current || current.threadId !== threadId) {
-    return 1;
-  }
-  return current.events.filter((event) => event.type === 'turn.completed').length + 1;
-}
-
-function buildSessionFromThreadRead(response: ThreadReadResponse): Session {
+function buildThreadFromThreadRead(response: ThreadReadResponse): ThreadState {
   const events: AgentEvent[] = [];
   let seq = 0;
-  let completedItems = 0;
-  let lastEventType: string | null = null;
 
   for (let turnIndex = 0; turnIndex < response.thread.turns.length; turnIndex += 1) {
     const turn = response.thread.turns[turnIndex];
@@ -250,10 +231,6 @@ function buildSessionFromThreadRead(response: ThreadReadResponse): Session {
         message: summary.message,
         turnId,
       });
-      lastEventType = summary.type;
-      if (summary.type === 'assistant.output') {
-        completedItems += 1;
-      }
     }
 
     if (turn.status === 'failed' && turn.error?.message) {
@@ -265,37 +242,15 @@ function buildSessionFromThreadRead(response: ThreadReadResponse): Session {
         message: turn.error.message,
         turnId,
       });
-      lastEventType = 'turn.error';
     }
-
-    seq += 1;
-    events.push({
-      seq,
-      timestamp: nowIso(),
-      type: 'turn.completed',
-      message: `${turnIndex + 1}`,
-      turnId,
-    });
-    lastEventType = 'turn.completed';
   }
-
-  const lastTurn = response.thread.turns[response.thread.turns.length - 1];
-  const status = lastTurn ? statusFromTurnStatus(lastTurn.status) : 'idle';
-  const currentTurnId =
-    lastTurn?.status === 'inProgress' ? syntheticReadTurnId(response.thread.id, response.thread.turns.length - 1) : null;
 
   return {
     id: response.thread.id,
     cwd: response.thread.cwd,
-    status,
     updatedAt: unixSecondsToIso(response.thread.updatedAt),
     threadId: response.thread.id,
-    currentTurnId,
     latestEventSeq: seq,
-    progress: {
-      completedItems,
-      lastEventType,
-    },
     events,
   };
 }
@@ -314,10 +269,9 @@ function App() {
   const [columnSearch, setColumnSearch] = useState<Record<string, string>>({});
   const [columnSelections, setColumnSelections] = useState<Record<string, string | null>>({});
   const [error, setError] = useState<string | null>(null);
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [session, setSession] = useState<Session | null>(null);
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [thread, setThread] = useState<ThreadState | null>(null);
   const [isFolderBrowserOpen, setIsFolderBrowserOpen] = useState(false);
-  const [isThinkingDialogOpen, setIsThinkingDialogOpen] = useState(false);
   const [prompt, setPrompt] = useState('');
   const [activeUiRequest, setActiveUiRequest] = useState<PendingUiRequest | null>(null);
   const [uiAnswers, setUiAnswers] = useState<Record<string, string>>({});
@@ -336,35 +290,25 @@ function App() {
   const activeThreadIdRef = useRef<string | null>(null);
   const queuedUiRequestsRef = useRef<PendingUiRequest[]>([]);
   const shouldStickToBottomRef = useRef(true);
-  const activeTurnByThreadRef = useRef<Map<string, string>>(new Map());
-
-  const activeSessionId = session?.id ?? '';
-  const selectorLabel = session ? `${session.id.slice(0, 8)} · ${session.cwd}` : 'Select session';
 
   const basePath = columnPaths.length > 0 ? (folderCache[columnPaths[0]]?.root ?? null) : null;
 
   const conversationEvents = useMemo(
-    () => (session?.events ?? []).filter((event) => isConversationEvent(event)),
-    [session?.events],
+    () => (thread?.events ?? []).filter((event) => isConversationEvent(event)),
+    [thread?.events],
   );
-
-  const thinkingEvents = useMemo(
-    () =>
-      session?.currentTurnId
-        ? (session.events ?? [])
-            .filter((event) => event.turnId === session.currentTurnId && isTransientProgressEvent(event))
-            .slice(-200)
-        : [],
-    [session?.currentTurnId, session?.events],
-  );
-  const isLiveWorkActive = session?.status === 'running' && session?.currentTurnId !== null;
+  const thinkingEvents = useMemo(() => (thread?.events ?? []).filter((event) => isTransientProgressEvent(event)), [thread?.events]);
+  const activeThreadId = thread?.threadId ?? null;
+  const selectorLabel = thread ? `${thread.id.slice(0, 8)} · ${thread.cwd}` : 'Select a thread';
+  const isLiveWorkActive = assistantTypingText.trim().length > 0;
+  const [isThinkingDialogOpen, setIsThinkingDialogOpen] = useState(false);
 
   useEffect(() => {
     void initializeFolderBrowser();
-    void refreshSessions();
-    const activeThreadId = readSessionIdFromUrl();
+    void refreshThreads();
+    const activeThreadId = readThreadIdFromUrl();
     if (activeThreadId) {
-      void resumeSession(activeThreadId, { updateUrl: true });
+      void resumeThread(activeThreadId, { updateUrl: true });
     }
 
     const onOffline = () => {
@@ -373,10 +317,10 @@ function App() {
 
     const onOnline = () => {
       setError('Network restored. Reconnecting...');
-      void refreshSessions();
-      const activeThreadId = readSessionIdFromUrl();
+      void refreshThreads();
+      const activeThreadId = readThreadIdFromUrl();
       if (activeThreadId) {
-        void resumeSession(activeThreadId, { updateUrl: true });
+        void resumeThread(activeThreadId, { updateUrl: true });
       }
     };
 
@@ -421,10 +365,10 @@ function App() {
     return () => {
       observer.disconnect();
     };
-  }, [session?.id]);
+  }, [thread?.id]);
 
   useEffect(() => {
-    if (!session) {
+    if (!thread) {
       shouldStickToBottomRef.current = true;
       setIsSentinelInView(false);
       return;
@@ -448,16 +392,16 @@ function App() {
     return () => {
       observer.disconnect();
     };
-  }, [session?.id]);
+  }, [thread?.id]);
 
   useEffect(() => {
-    if (!session) {
+    if (!thread) {
       return;
     }
     requestAnimationFrame(() => {
       conversationEndRef.current?.scrollIntoView({ block: 'end', inline: 'nearest' });
     });
-  }, [session?.id, session?.latestEventSeq]);
+  }, [thread?.id, thread?.latestEventSeq]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -474,11 +418,11 @@ function App() {
   }, []);
 
   useEffect(() => {
-    activeThreadIdRef.current = session?.threadId ?? null;
-  }, [session?.threadId]);
+    activeThreadIdRef.current = thread?.threadId ?? null;
+  }, [thread?.threadId]);
 
   useEffect(() => {
-    const threadId = session?.threadId ?? null;
+    const threadId = thread?.threadId ?? null;
     if (!threadId) {
       threadEventsSourceRef.current?.close();
       threadEventsSourceRef.current = null;
@@ -518,14 +462,14 @@ function App() {
         threadEventsSourceThreadIdRef.current = null;
       }
     };
-  }, [session?.threadId]);
+  }, [thread?.threadId]);
 
   useEffect(() => {
-    if (!session) {
+    if (!thread) {
       return;
     }
     promptInputRef.current?.focus();
-  }, [session?.id]);
+  }, [thread?.id]);
 
   useEffect(() => {
     if (!pendingFocusPath) {
@@ -558,57 +502,20 @@ function App() {
     return listing.entries.filter((entry) => entry.kind === 'directory');
   }
 
-  function pushEventToSession(threadId: string, type: string, message: string, turnIdOverride?: string | null) {
-    const turnId = turnIdOverride ?? activeTurnByThreadRef.current.get(threadId) ?? null;
-    setSession((current) => {
+  function pushEventToThread(threadId: string, type: string, message: string, turnId: string | null = null) {
+    setThread((current) => {
       if (!current || current.threadId !== threadId) {
         return current;
       }
 
       const seq = current.latestEventSeq + 1;
       const nextEventsWithTurn = [...current.events, { seq, timestamp: nowIso(), type, message, turnId }];
-      const nextProgress = {
-        completedItems: type === 'assistant.output' ? current.progress.completedItems + 1 : current.progress.completedItems,
-        lastEventType: type,
-      };
 
       return {
         ...current,
         latestEventSeq: seq,
         updatedAt: nowIso(),
         events: nextEventsWithTurn,
-        progress: nextProgress,
-      };
-    });
-  }
-
-  function setThreadCurrentTurn(threadId: string, turnId: string | null) {
-    if (turnId) {
-      activeTurnByThreadRef.current.set(threadId, turnId);
-    } else {
-      activeTurnByThreadRef.current.delete(threadId);
-    }
-    setSession((current) => {
-      if (!current || current.threadId !== threadId) {
-        return current;
-      }
-      return {
-        ...current,
-        currentTurnId: turnId,
-      };
-    });
-  }
-
-  function setThreadStatus(threadId: string, status: SessionStatus) {
-    setSessions((current) => current.map((item) => (item.id === threadId ? { ...item, status, updatedAt: nowIso() } : item)));
-    setSession((current) => {
-      if (!current || current.threadId !== threadId) {
-        return current;
-      }
-      return {
-        ...current,
-        status,
-        updatedAt: nowIso(),
       };
     });
   }
@@ -742,28 +649,12 @@ function App() {
       return;
     }
 
-    if (method === 'turn/started' && typeof payload.threadId === 'string') {
-      const turnId = extractTurnId(payload) ?? `live-turn:${payload.threadId}:${Date.now()}`;
-      setThreadCurrentTurn(payload.threadId, turnId);
-      setThreadStatus(payload.threadId, 'running');
-      setAssistantTypingText('');
-      return;
-    }
-
     if (method === 'turn/completed' && typeof payload.threadId === 'string') {
-      const completedTurnId = extractTurnId(payload);
-      const activeTurnId = activeTurnByThreadRef.current.get(payload.threadId) ?? null;
-      const eventTurnId = completedTurnId ?? activeTurnId;
-      setThreadCurrentTurn(payload.threadId, null);
-      const turnStatus = payload.turn?.status as string | undefined;
-      const nextStatus: SessionStatus = turnStatus === 'failed' ? 'error' : 'idle';
-      pushEventToSession(payload.threadId, 'turn.completed', `${nextCompletedTurnNumber(session, payload.threadId)}`, eventTurnId);
-      setThreadStatus(payload.threadId, nextStatus);
-      if (nextStatus === 'error' && payload.turn?.error?.message) {
-        pushEventToSession(payload.threadId, 'turn.error', payload.turn.error.message, eventTurnId);
+      const turnStatus = typeof payload.turn?.status === 'string' ? payload.turn.status : '';
+      if (turnStatus === 'failed' && payload.turn?.error?.message) {
+        pushEventToThread(payload.threadId, 'turn.error', payload.turn.error.message, extractTurnId(payload));
       }
-      setAssistantTypingText('');
-      void refreshSessions();
+      void refreshThreads();
       return;
     }
 
@@ -781,7 +672,7 @@ function App() {
       if (summary.type === 'assistant.output') {
         setAssistantTypingText('');
       }
-      pushEventToSession(payload.threadId, summary.type, summary.message, extractTurnId(payload));
+      pushEventToThread(payload.threadId, summary.type, summary.message, extractTurnId(payload));
       return;
     }
 
@@ -790,7 +681,7 @@ function App() {
         return;
       }
       setAssistantTypingText((current) => current + payload.delta);
-      pushEventToSession(payload.threadId, 'agent.delta', payload.delta, extractTurnId(payload));
+      pushEventToThread(payload.threadId, 'agent.delta', payload.delta, extractTurnId(payload));
       return;
     }
 
@@ -833,26 +724,21 @@ function App() {
     }
   }
 
-  async function refreshSessions() {
+  async function refreshThreads() {
     try {
       const result = await rpcPost<any>('thread/list', {
         limit: 50,
         archived: false,
       });
-      const listedSessions = extractThreadList(result);
+      const listedThreads = extractThreadList(result);
 
-      setSessions((current) =>
-        (listedSessions.length > 0 ? listedSessions : current)
-          .map((thread) => {
-            const existing = current.find((item) => item.id === thread.id);
-            const updatedAt = typeof thread.updatedAt === 'number' ? unixSecondsToIso(thread.updatedAt) : thread.updatedAt;
-            return {
-              id: thread.id,
-              cwd: thread.cwd,
-              updatedAt,
-              status: existing?.status ?? 'idle',
-            };
-          })
+      setThreads((current) =>
+        (listedThreads.length > 0 ? listedThreads : current)
+          .map((thread) => ({
+            id: thread.id,
+            cwd: thread.cwd,
+            updatedAt: typeof thread.updatedAt === 'number' ? unixSecondsToIso(thread.updatedAt) : thread.updatedAt,
+          }))
           .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)),
       );
     } catch (err: unknown) {
@@ -860,7 +746,7 @@ function App() {
     }
   }
 
-  async function startSessionForPath(targetPath: string) {
+  async function startThreadForPath(targetPath: string) {
     try {
       setError(null);
       const listing = await loadFolder(targetPath);
@@ -872,31 +758,25 @@ function App() {
         persistExtendedHistory: true,
       });
 
-      const nextSession: Session = {
+      const nextThread: ThreadState = {
         id: response.thread.id,
         cwd: response.thread.cwd,
-        status: 'idle',
         updatedAt: unixSecondsToIso(response.thread.updatedAt),
         threadId: response.thread.id,
-        currentTurnId: null,
         latestEventSeq: 0,
-        progress: {
-          completedItems: 0,
-          lastEventType: null,
-        },
         events: [],
       };
 
-      setSession(nextSession);
-      writeSessionIdToUrl(nextSession.threadId);
+      setThread(nextThread);
+      writeThreadIdToUrl(nextThread.threadId);
       setIsFolderBrowserOpen(false);
-      await refreshSessions();
+      await refreshThreads();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }
 
-  async function resumeSession(threadId: string, options?: { updateUrl?: boolean }) {
+  async function resumeThread(threadId: string, options?: { updateUrl?: boolean }) {
     try {
       setError(null);
       let response: ThreadReadResponse;
@@ -910,45 +790,38 @@ function App() {
           includeTurns: true,
         });
       }
-      const loaded = buildSessionFromThreadRead(response);
-      setSession(loaded);
-      setThreadCurrentTurn(threadId, loaded.currentTurnId);
+      const loaded = buildThreadFromThreadRead(response);
+      setThread(loaded);
       if (options?.updateUrl !== false) {
-        writeSessionIdToUrl(threadId);
+        writeThreadIdToUrl(threadId);
       }
-      await refreshSessions();
+      await refreshThreads();
     } catch (err: unknown) {
       if (options?.updateUrl !== false && isThreadNotFoundError(err)) {
-        writeSessionIdToUrl(null);
+        writeThreadIdToUrl(null);
       }
       setError(err instanceof Error ? err.message : String(err));
     }
   }
 
-  function selectSessionSummary(threadId: string) {
-    const summary = sessions.find((item) => item.id === threadId);
+  function selectThreadSummary(threadId: string) {
+    const summary = threads.find((item) => item.id === threadId);
     if (!summary) {
       return;
     }
-    setSession({
+    setThread({
       id: summary.id,
       cwd: summary.cwd,
-      status: summary.status,
       updatedAt: summary.updatedAt,
       threadId: summary.id,
-      currentTurnId: null,
       latestEventSeq: 0,
-      progress: {
-        completedItems: 0,
-        lastEventType: null,
-      },
       events: [],
     });
   }
 
   async function submitPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!session || !prompt.trim()) {
+    if (!thread || !prompt.trim()) {
       return;
     }
 
@@ -957,10 +830,9 @@ function App() {
     try {
       setError(null);
       setPrompt('');
-      setThreadStatus(session.threadId, 'running');
 
       const turnParams = {
-        threadId: session.threadId,
+        threadId: thread.threadId,
         input: [
           {
             type: 'text',
@@ -976,21 +848,20 @@ function App() {
         if (!isThreadNotFoundError(error)) {
           throw error;
         }
-        await rpcPost('thread/resume', { threadId: session.threadId });
+        await rpcPost('thread/resume', { threadId: thread.threadId });
         await rpcPost('turn/start', turnParams);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
-      setThreadStatus(session.threadId, 'error');
-      pushEventToSession(session.threadId, 'turn.error', message);
+      pushEventToThread(thread.threadId, 'turn.error', message);
     }
   }
 
   function handlePromptKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
-      if (!session || !prompt.trim() || session.status === 'running') {
+      if (!thread || !prompt.trim()) {
         return;
       }
       event.currentTarget.form?.requestSubmit();
@@ -1008,26 +879,26 @@ function App() {
       <nav className="navbar bg-body-tertiary border-bottom fixed-top">
         <div className="container-fluid px-3">
           <div className="d-flex align-items-center gap-2 w-100">
-            {sessions.length > 0 ? (
+            {threads.length > 0 ? (
               <Listbox
-                value={activeSessionId}
-                onChange={(nextSessionId) => {
-                  if (nextSessionId) {
-                    selectSessionSummary(nextSessionId);
-                    void resumeSession(nextSessionId);
+                value={activeThreadId}
+                onChange={(nextThreadId) => {
+                  if (nextThreadId) {
+                    selectThreadSummary(nextThreadId);
+                    void resumeThread(nextThreadId);
                   }
                 }}
               >
                 <div className="position-relative flex-grow-1 min-w-0">
                   <ListboxButton
                     className="form-select form-select-sm text-start w-100 focus-ring focus-ring-primary"
-                    aria-label="Select active session"
+                    aria-label="Select active thread"
                     tabIndex={0}
                   >
                     <span className="text-truncate d-block w-100 pe-4">{selectorLabel}</span>
                   </ListboxButton>
                   <ListboxOptions className="position-absolute start-0 mt-1 w-100 border rounded bg-white shadow-sm p-1 z-3 folder-list">
-                    {sessions.map((item) => (
+                    {threads.map((item) => (
                       <ListboxOption
                         key={item.id}
                         value={item.id}
@@ -1042,7 +913,7 @@ function App() {
                             <div className="small font-mono fw-semibold">{item.id.slice(0, 8)}</div>
                             <div className="small text-secondary text-truncate">{item.cwd}</div>
                           </div>
-                          {item.id === activeSessionId ? <i className="bi bi-check2 mt-1" aria-hidden="true" /> : null}
+                          {item.id === activeThreadId ? <i className="bi bi-check2 mt-1" aria-hidden="true" /> : null}
                         </div>
                       </ListboxOption>
                     ))}
@@ -1051,7 +922,7 @@ function App() {
               </Listbox>
             ) : (
               <button className="form-select form-select-sm text-start w-100" type="button" disabled>
-                <span className="d-block text-secondary pe-4">No active sessions</span>
+                <span className="d-block text-secondary pe-4">No active threads</span>
               </button>
             )}
             <button
@@ -1087,13 +958,13 @@ function App() {
           }))
         }
         onSelectDirectory={onSelectDirectory}
-        onOpenAgentForPath={startSessionForPath}
+        onOpenAgentForPath={startThreadForPath}
       />
 
       <main className="container-fluid px-3 py-3">
         {error ? <div className="alert alert-danger">{error}</div> : null}
         <AgentThreadPanel
-          session={session}
+          thread={thread}
           conversationEvents={conversationEvents}
           assistantTypingText={assistantTypingText}
           conversationEndRef={conversationEndRef}
@@ -1106,7 +977,7 @@ function App() {
         />
       </main>
 
-      {session ? (
+      {thread ? (
         <button
           type="button"
           className={`btn btn-light border shadow-sm thinking-fab d-inline-flex align-items-center gap-2 ${

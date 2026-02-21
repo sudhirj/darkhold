@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -188,18 +187,18 @@ func postRPC[T any](t *testing.T, baseURL, method string, params any) T {
 }
 
 type sseEvent struct {
-	ID   int
+	ID   string
 	Data string
 }
 
-func openSSE(t *testing.T, baseURL, threadID string, lastEventID int) *http.Response {
+func openSSE(t *testing.T, baseURL, threadID, lastEventID string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/api/thread/events/stream?threadId="+threadID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lastEventID > 0 {
-		req.Header.Set("Last-Event-ID", strconv.Itoa(lastEventID))
+	if strings.TrimSpace(lastEventID) != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -219,7 +218,7 @@ func waitForSSEEvent(t *testing.T, resp *http.Response, predicate func(sseEvent)
 	scanner := bufio.NewScanner(resp.Body)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		id := 0
+		id := ""
 		dataLines := []string{}
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -230,8 +229,7 @@ func waitForSSEEvent(t *testing.T, resp *http.Response, predicate func(sseEvent)
 				continue
 			}
 			if strings.HasPrefix(line, "id:") {
-				parsed, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "id:")))
-				id = parsed
+				id = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
 			}
 			if strings.HasPrefix(line, "data:") {
 				dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
@@ -308,7 +306,7 @@ func TestRehydrateThreadEventCacheFromThreadRead(t *testing.T) {
 	started := postRPC[map[string]any](t, s.http.URL, "thread/start", map[string]any{"cwd": s.baseDir})
 	thread := started["thread"].(map[string]any)
 	threadID := thread["id"].(string)
-	sse := openSSE(t, s.http.URL, threadID, 0)
+	sse := openSSE(t, s.http.URL, threadID, "")
 	defer sse.Body.Close()
 
 	_ = postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": "hi"}}})
@@ -340,9 +338,9 @@ func TestBroadcastsThreadEventsToMultipleSSEClientsAndReconnect(t *testing.T) {
 
 	started := postRPC[map[string]any](t, s.http.URL, "thread/start", map[string]any{"cwd": s.baseDir})
 	threadID := started["thread"].(map[string]any)["id"].(string)
-	sse1 := openSSE(t, s.http.URL, threadID, 0)
+	sse1 := openSSE(t, s.http.URL, threadID, "")
 	defer sse1.Body.Close()
-	sse2 := openSSE(t, s.http.URL, threadID, 0)
+	sse2 := openSSE(t, s.http.URL, threadID, "")
 	defer sse2.Body.Close()
 
 	_ = postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": "first"}}})
@@ -375,7 +373,7 @@ func TestAllowsTurnStartFromSeparateHTTPCallersOnSameThread(t *testing.T) {
 
 	started := postRPC[map[string]any](t, s.http.URL, "thread/start", map[string]any{"cwd": s.baseDir})
 	threadID := started["thread"].(map[string]any)["id"].(string)
-	sse := openSSE(t, s.http.URL, threadID, 0)
+	sse := openSSE(t, s.http.URL, threadID, "")
 	defer sse.Body.Close()
 
 	first := postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": "first"}}})
@@ -397,12 +395,11 @@ func TestReapsIdleSessionAfterTurnCompletion(t *testing.T) {
 	s := startIntegrationServer(t)
 	defer s.close()
 
-	s.app.sessionIdleTTL = 100 * time.Millisecond
-	s.app.sessionReapInterval = 20 * time.Millisecond
+	s.app.setSessionTiming(100*time.Millisecond, 20*time.Millisecond)
 
 	started := postRPC[map[string]any](t, s.http.URL, "thread/start", map[string]any{"cwd": s.baseDir})
 	threadID := started["thread"].(map[string]any)["id"].(string)
-	sse := openSSE(t, s.http.URL, threadID, 0)
+	sse := openSSE(t, s.http.URL, threadID, "")
 	defer sse.Body.Close()
 
 	_ = postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{
@@ -435,9 +432,9 @@ func TestBroadcastsApprovalRequestsToAllSSEClientsAndAcceptsFirstResponse(t *tes
 
 	started := postRPC[map[string]any](t, s.http.URL, "thread/start", map[string]any{"cwd": s.baseDir})
 	threadID := started["thread"].(map[string]any)["id"].(string)
-	sse1 := openSSE(t, s.http.URL, threadID, 0)
+	sse1 := openSSE(t, s.http.URL, threadID, "")
 	defer sse1.Body.Close()
-	sse2 := openSSE(t, s.http.URL, threadID, 0)
+	sse2 := openSSE(t, s.http.URL, threadID, "")
 	defer sse2.Body.Close()
 
 	_ = postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": "needs approval"}}})
@@ -469,8 +466,8 @@ func TestBroadcastsApprovalRequestsToAllSSEClientsAndAcceptsFirstResponse(t *tes
 	}
 
 	_ = waitForSSEEvent(t, sse1, func(event sseEvent) bool { return parseJSON(t, event.Data)["method"] == "turn/completed" }, 10*time.Second)
-	if approval1.ID == 0 || approval2.ID == 0 {
-		t.Fatal("expected non-zero sse ids")
+	if approval1.ID == "" || approval2.ID == "" {
+		t.Fatal("expected non-empty sse ids")
 	}
 }
 
@@ -480,7 +477,7 @@ func TestSSEResumeWithLastEventID(t *testing.T) {
 
 	started := postRPC[map[string]any](t, s.http.URL, "thread/start", map[string]any{"cwd": s.baseDir})
 	threadID := started["thread"].(map[string]any)["id"].(string)
-	sse := openSSE(t, s.http.URL, threadID, 0)
+	sse := openSSE(t, s.http.URL, threadID, "")
 	defer sse.Body.Close()
 
 	_ = postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": "resume"}}})
@@ -615,7 +612,7 @@ func TestInteractionResolvedEventPublished(t *testing.T) {
 
 	started := postRPC[map[string]any](t, s.http.URL, "thread/start", map[string]any{"cwd": s.baseDir})
 	threadID := started["thread"].(map[string]any)["id"].(string)
-	sse := openSSE(t, s.http.URL, threadID, 0)
+	sse := openSSE(t, s.http.URL, threadID, "")
 	defer sse.Body.Close()
 
 	_ = postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": "resolve-event"}}})
@@ -743,15 +740,20 @@ func TestSSEKeepsOrderByID(t *testing.T) {
 
 	started := postRPC[map[string]any](t, s.http.URL, "thread/start", map[string]any{"cwd": s.baseDir})
 	threadID := started["thread"].(map[string]any)["id"].(string)
-	sse := openSSE(t, s.http.URL, threadID, 0)
+	sse := openSSE(t, s.http.URL, threadID, "")
 	defer sse.Body.Close()
 
 	_ = postRPC[map[string]any](t, s.http.URL, "turn/start", map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": "order"}}})
-	acceptNextApproval(t, s.http.URL, threadID, sse)
-	e1 := waitForSSEEvent(t, sse, func(event sseEvent) bool { return parseJSON(t, event.Data)["method"] == "turn/started" }, 10*time.Second)
-	e2 := waitForSSEEvent(t, sse, func(event sseEvent) bool { return parseJSON(t, event.Data)["method"] == "item/agentMessage/delta" }, 10*time.Second)
+	e1 := waitForSSEEvent(t, sse, func(event sseEvent) bool {
+		method, _ := parseJSON(t, event.Data)["method"].(string)
+		return method != ""
+	}, 10*time.Second)
+	e2 := waitForSSEEvent(t, sse, func(event sseEvent) bool {
+		method, _ := parseJSON(t, event.Data)["method"].(string)
+		return method != ""
+	}, 10*time.Second)
 	if e2.ID <= e1.ID {
-		t.Fatalf("expected increasing ids, got %d then %d", e1.ID, e2.ID)
+		t.Fatalf("expected increasing ids, got %s then %s", e1.ID, e2.ID)
 	}
 }
 

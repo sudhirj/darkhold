@@ -53,6 +53,7 @@ Web client:
 - Use `go test ./...` for backend feature coverage.
 - Cover: bind/port parsing, CIDR filtering, folder traversal safety, session spawn/stop, thread input handling, interaction respond flow, and SSE event streaming/rehydration.
 - Web client checks should include `npm --prefix clients/web run typecheck`.
+- When changing files under `clients/web/`, always run `npm --prefix clients/web run build`.
 - Test names should describe behavior (example: `starts agent when folder is selected`).
 
 ## Commit & Pull Request Guidelines
