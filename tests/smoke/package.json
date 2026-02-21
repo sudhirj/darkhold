@@ -1,0 +1,12 @@
+{
+  "name": "darkhold-smoke-tests",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "tsx smoke.test.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
