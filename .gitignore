@@ -5,3 +5,4 @@ dist/
 .DS_Store
 .tmp/
 internal/server/webdist/assets/
+internal/server/webdist/index.html
