@@ -1111,7 +1111,10 @@ function App() {
           aria-label="Show thinking events"
           title="Show thinking events"
         >
-          <span className="spinner-border spinner-border-sm text-primary" aria-hidden="true" />
+          <span
+            className={`spinner-border spinner-border-sm ${isLiveWorkActive ? 'text-primary' : 'text-secondary'}`}
+            aria-hidden="true"
+          />
           <span className="small fw-semibold">{thinkingEvents.length}</span>
         </button>
       ) : null}
