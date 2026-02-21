@@ -15,7 +15,6 @@ Go server commands:
 - `go test ./...` runs Go unit/integration tests.
 - `./dev-go-server` builds `clients/web`, builds Go binary, and runs server.
 - `./dev-hot` rebuilds embedded web bundle + Go binary on change and restarts server.
-- `./dev-hmr` runs Go hot reload and Vite HMR in parallel.
 
 Web client commands (scoped to `clients/web`):
 - `npm --prefix clients/web install` installs web dependencies.

@@ -60,10 +60,6 @@ input,
   white-space: pre-wrap;
 }
 
-.user-message-row {
-  border-bottom: 2px solid rgba(25, 135, 84, 0.22);
-}
-
 .user-message-text {
   font-weight: 520;
   opacity: 0.88;

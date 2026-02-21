@@ -9,4 +9,7 @@ if ! command -v air >/dev/null 2>&1; then
   exit 1
 fi
 
+echo "Starting Darkhold in embedded rebuild mode on http://127.0.0.1:3275"
+echo "Note: this mode rebuilds and restarts on changes."
+
 air -c .air.toml "$@"

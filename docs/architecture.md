@@ -136,9 +136,6 @@ The server is the only component that talks to `codex app-server`, and it does s
 ## Development Modes
 - Embedded bundle mode: `./dev-hot`
   - Rebuild web bundle and Go binary on change, restart server.
-- Split HMR mode: `./dev-hmr`
-  - Go hot reload on `127.0.0.1:3275`.
-  - Vite HMR on `127.0.0.1:5173` with `/api` proxy.
 
 ## Current Boundaries and Future Extension Points
 - Current boundary:

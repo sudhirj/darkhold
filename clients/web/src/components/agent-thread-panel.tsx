@@ -76,7 +76,7 @@ export function AgentThreadPanel({
                       <div
                         key={agentEvent.seq}
                         className={`ps-2 py-2 ${rowClassForRole(role)} ${index > 0 ? 'border-top' : ''} ${
-                          role === 'user' ? 'user-message-row' : ''
+                          role === 'user' ? 'border-bottom border-secondary-subtle' : ''
                         }`}
                       >
                         <div className="d-flex align-items-baseline">
